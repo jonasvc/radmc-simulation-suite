@@ -20,7 +20,7 @@ class SimulationLogbook:
     Appends data after each simulation run
     """
     
-    def __init__(self, logbook_path="../../Simulations/simulation_logbook.xlsx"):
+    def __init__(self, logbook_path="/home/main/RADMC/Simulations/simulation_logbook.xlsx"):
         """
         Initialize logbook
         
@@ -278,7 +278,7 @@ class SimulationLogbook:
         return output_path
 
 
-def view_logbook(logbook_path="../../Simulations/simulation_logbook.xlsx", last_n=20):
+def view_logbook(logbook_path="/home/main/RADMC/Simulations/simulation_logbook.xlsx", last_n=20):
     """
     Quick function to view the logbook
     
@@ -325,7 +325,7 @@ def view_logbook(logbook_path="../../Simulations/simulation_logbook.xlsx", last_
 # Convenience function for scripts
 def log_simulation(params, run_dir, name, timestamp, runtime_minutes, 
                   status="SUCCESS", error_msg=None,
-                  logbook_path="../../Simulations/simulation_logbook.xlsx"):
+                  logbook_path="/home/main/RADMC/Simulations/simulation_logbook.xlsx"):
     """
     Convenience function to log a simulation
     

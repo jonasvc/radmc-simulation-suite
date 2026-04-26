@@ -1,89 +1,44 @@
 """
-Module for running batch simulations with multiple parameter combinations
-Edit the param_combinations list to define your parameter grid
+Module for running batch simulations with multiple parameter combinations.
+
+Folder layout (sandbox):
+    simulations/sandbox/batch/<YYYY-MM-DD_HHMM_name>/
+    +-- batch_summary.txt
+    +-- config_base.py
+    +-- batch_run.py
+    +-- 001_suffix-a/
+    +-- 002_suffix-b/
+
+Folder layout (IRYSS):
+    simulations/iryss/<source>/<opacity>_incl<incl>/batch/<YYYY-MM-DD_HHMM_name>/
+    +-- batch_summary.txt
+    +-- config_base.py
+    +-- batch_run.py
+    +-- 001_suffix-a/
+    +-- 002_suffix-b/
+
+Edit param_combinations below to define your parameter grid.
 """
 
 import os
 import time
 import logging
 import shutil
-import copy
-from main import setup_logging, get_params_dict
+import json
+from main import setup_logging, get_params_dict, resolve_config_path, SIMULATIONS_ROOT
 from single_run import run_single_simulation
 from plots import create_all_plots
-import config
 
-
-############################
-### NAMING CONFIGURATION ###
-############################
-
-# Set how batch run names should be formatted:
-# "simple"   -> mytest_baseline_batch001
-# "detailed" -> baseline_run_20231115_143022_batch001_mytest_baseline  
-BATCH_NAMING_MODE = "detailed"
 
 ###############################################
 ### DEFINE YOUR PARAMETER COMBINATIONS HERE ###
 ###############################################
 
 param_combinations = [
-    # Example 1: Baseline model
     {
-        "name_suffix": "baseline",
-        "mdisk": "0.01*ms",
-        "hrdisk": 0.117,
-        "h_spiral_amp": 0.0,
-        "sig_spiral_amp": 0.0,
+        "name_suffix": "scat_2e10",
+        "nphot_scat":  "2e+10",
     },
-    
-    # Example 2: With spiral structure
-    {
-        "name_suffix": "spiral_weak",
-        "mdisk": "0.01*ms",
-        "hrdisk": 0.117,
-        "h_spiral_amp": 0.1,
-        "sig_spiral_amp": 0.2,
-        "n_arms": 2,
-        "spiral_pitch": 1.0,
-    },
-    
-    # Example 3: Stronger spiral
-    {
-        "name_suffix": "spiral_strong",
-        "mdisk": "0.01*ms",
-        "hrdisk": 0.117,
-        "h_spiral_amp": 0.2,
-        "sig_spiral_amp": 0.5,
-        "n_arms": 2,
-        "spiral_pitch": 1.0,
-    },
-    
-    # Example 4: With vortex
-    {
-        "name_suffix": "vortex",
-        "mdisk": "0.01*ms",
-        "hrdisk": 0.117,
-        "sig_vortex_amp": [0.5, 0.5],
-        "h_vortex_amp": [0.2, 0.2],
-    },
-    
-    # Example 5: Higher mass disk
-    {
-        "name_suffix": "highmass",
-        "mdisk": "0.02*ms",
-        "hrdisk": 0.117,
-    },
-    
-    # Example 6: Different flaring
-    {
-        "name_suffix": "flared",
-        "mdisk": "0.01*ms",
-        "hrdisk": 0.15,
-        "plh": 0.4,
-    },
-    
-    # Add more combinations as needed...
 ]
 
 
@@ -92,72 +47,10 @@ param_combinations = [
 ########################
 
 def merge_params(base_params, override_params):
-    """
-    Merge base parameters with override parameters
-    
-    Parameters:
-    -----------
-    base_params : dict
-        Base parameter dictionary from config
-    override_params : dict
-        Parameters to override
-        
-    Returns:
-    --------
-    dict with merged parameters
-    """
-    # Use simple dict copy instead of deepcopy to avoid module pickling issues
+    """Merge base parameters with per-combination overrides."""
     merged = base_params.copy()
-    
-    # Don't merge the name_suffix into params
-    override = {k: v for k, v in override_params.items() if k != 'name_suffix'}
-    merged.update(override)
-    
+    merged.update({k: v for k, v in override_params.items() if k != 'name_suffix'})
     return merged
-
-
-def create_batch_run_directory(base_name, name_suffix, params, batch_idx, base_timestamp):
-    """
-    Create directory for a batch run with simplified naming
-    
-    Parameters:
-    -----------
-    base_name : str
-        User-provided base name
-    name_suffix : str
-        Suffix from param_combinations
-    params : dict
-        Simulation parameters
-    batch_idx : int
-        Batch index (1, 2, 3, ...)
-    base_timestamp : str
-        Base timestamp
-        
-    Returns:
-    --------
-    run_dir : str
-        Directory path
-    run_name : str
-        Run name
-    timestamp : str
-        Timestamp with batch number
-    """
-    
-    timestamp = base_timestamp + f"_batch{batch_idx:03d}"
-    
-    if BATCH_NAMING_MODE == "simple":
-        # Simple format: basename_suffix_batchXXX
-        run_name = f"{base_name}_{name_suffix}_batch{batch_idx:03d}"
-        base_dir = "../../Simulations/Batch"
-        run_dir = os.path.join(base_dir, run_name)
-    else:
-        # Detailed format: uses naming.py with full categorization
-        from naming import generate_run_directory
-        combined_name = f"{base_name}_{name_suffix}"
-        base_dir = "../../Simulations/Batch"
-        run_dir, run_name = generate_run_directory(base_dir, combined_name, params, timestamp)
-    
-    return run_dir, run_name, timestamp
 
 
 ###########################
@@ -165,190 +58,177 @@ def create_batch_run_directory(base_name, name_suffix, params, batch_idx, base_t
 ###########################
 
 def run_batch_mode(user_inputs, base_timestamp):
-    """
-    Execute batch runs with multiple parameter combinations
-    
-    Parameters:
-    -----------
-    user_inputs : dict
-        User input configuration from main.py
-    base_timestamp : str
-        Base timestamp string
-    """
-    
-    base_name = user_inputs['name']
-    make_images = user_inputs['make_images']
-    wavelength = user_inputs['wavelength']
-    reference_sed = user_inputs['reference_sed']
-    ui_mode = user_inputs['ui_mode'] 
-    
-    print("\n" + "="*60)
-    print(f"BATCH MODE: Running {len(param_combinations)} simulations")
-    print(f"Naming mode: {BATCH_NAMING_MODE}")
-    print("="*60 + "\n")
-    
-    # Get base parameters from config
-    base_params = get_params_dict()
-    
-    # Track overall batch timing
-    batch_start_time = time.time()
-    results_summary = []
-    
-    # Loop over all parameter combinations
-    for idx, param_combo in enumerate(param_combinations, start=1):
-        
-        print(f"\n{'='*60}")
-        print(f"Batch Progress: Simulation {idx}/{len(param_combinations)}")
-        print(f"Configuration: {param_combo.get('name_suffix', 'unnamed')}")
-        print(f"{'='*60}\n")
-        
-        # Get name suffix
-        name_suffix = param_combo.get('name_suffix', f'combo_{idx}')
-        
-        # Merge parameters
-        params = merge_params(base_params, param_combo)
-        
-        # Create run directory with appropriate naming
-        run_dir, run_name, timestamp = create_batch_run_directory(
-            base_name, name_suffix, params, idx, base_timestamp
+    """Execute batch runs with multiple parameter combinations."""
+
+    base_name       = user_inputs['name']
+    iryss_meta      = user_inputs['iryss_meta']
+    config_name     = user_inputs['config_name']
+    make_images     = user_inputs['make_images']
+    make_image_cube = user_inputs.get('make_image_cube', False)
+    wavelength      = user_inputs['wavelength']
+    reference_sed   = user_inputs['reference_sed']
+    ui_mode         = user_inputs['ui_mode']
+
+    print("\n" + "=" * 60)
+    print(f"BATCH MODE: {len(param_combinations)} combinations")
+    print(f"Type:        {'IRYSS' if iryss_meta else 'Sandbox'}")
+    print(f"Base config: {config_name or 'config.py'}")
+    if iryss_meta:
+        print(f"Source:      {iryss_meta['source']}")
+        print(f"Opacity:     {iryss_meta['opacity']}")
+        print(f"Inclination: {iryss_meta['inclination']}°")
+    print("=" * 60 + "\n")
+
+    # Load base parameters
+    from config_loader import load_config, get_params_dict_from_config
+    if config_name:
+        config      = load_config(config_name)
+        base_params = get_params_dict_from_config(config)
+        print(f"Loaded base config: {config_name}\n")
+    else:
+        import config as cfg
+        base_params = get_params_dict(cfg)
+        print("Loaded default config.py\n")
+
+    # Build batch root directory
+    from naming import generate_batch_run_directory, format_timestamp
+    short_ts   = format_timestamp(base_timestamp)
+
+    if iryss_meta:
+        source  = iryss_meta['source']
+        opacity = iryss_meta['opacity']
+        incl    = iryss_meta['inclination']
+        batch_root = os.path.join(
+            SIMULATIONS_ROOT, 'iryss', source,
+            f"{opacity}_incl{incl}",
+            'batch', f"{short_ts}_{base_name}"
         )
-        
-        # Create directory
+    else:
+        batch_root = os.path.join(
+            SIMULATIONS_ROOT, 'sandbox', 'batch', f"{short_ts}_{base_name}"
+        )
+
+    os.makedirs(batch_root, exist_ok=True)
+
+    # Copy base config and batch script to batch root
+    config_path = resolve_config_path(config_name)
+    if os.path.exists(config_path):
+        shutil.copy(config_path, os.path.join(batch_root, "config_base.py"))
+    if os.path.exists("batch_run.py"):
+        shutil.copy("batch_run.py", os.path.join(batch_root, "batch_run.py"))
+
+    batch_start = time.time()
+    results     = []
+
+    for idx, param_combo in enumerate(param_combinations, start=1):
+
+        name_suffix = param_combo.get('name_suffix', f'combo_{idx}')
+        params      = merge_params(base_params, param_combo)
+
+        run_name = f"{idx:03d}_{name_suffix}"
+        run_dir  = os.path.join(batch_root, run_name)
         os.makedirs(run_dir, exist_ok=True)
-        
-        # Setup logging
-        setup_logging(run_dir, run_name, timestamp)
-        
-        logging.info(f"Batch run {idx}/{len(param_combinations)}: {run_name}")
-        logging.info(f"Making Images = {make_images}")
-        if make_images:
-            logging.info(f"Image wavelength = {wavelength} µm")
-        
-        # Log parameter changes
+
+        print(f"\n{'='*60}")
+        print(f"[{idx}/{len(param_combinations)}]  {run_name}")
+        print("=" * 60)
+
+        setup_logging(run_dir)
+
+        logging.info(f"Batch combination: {run_name}")
+        logging.info(f"Base config: {config_name or 'config.py'}")
+        if iryss_meta:
+            logging.info(f"IRYSS source:      {iryss_meta['source']}")
+            logging.info(f"IRYSS opacity:     {iryss_meta['opacity']}")
+            logging.info(f"IRYSS inclination: {iryss_meta['inclination']}")
         logging.info("Modified parameters:")
-        for key, value in param_combo.items():
-            if key != 'name_suffix':
-                logging.info(f"  {key} = {value}")
-        
-        # Run simulation
-        run_start_time = time.time()
-        
+        for k, v in param_combo.items():
+            if k != 'name_suffix':
+                logging.info(f"  {k} = {v}")
+
+        run_start = time.time()
         try:
             spec, star, grid = run_single_simulation(
                 params=params,
                 run_dir=run_dir,
                 name=run_name,
-                timestamp=timestamp,
+                timestamp=base_timestamp,
                 make_images=make_images,
+                make_image_cube=make_image_cube,
                 wavelength=wavelength,
-                threads=config.threads,
-                ui_mode=ui_mode
+                threads=params['threads'],
+                ui_mode=ui_mode,
             )
-            
-            # Create plots
+
             create_all_plots(
                 run_dir=run_dir,
-                name=run_name,
-                timestamp=timestamp,
-                pc=config.pc,
+                pc=params['pc'],
                 wav=wavelength,
-                reference_file=reference_sed
+                reference_file=reference_sed,
             )
-            
-            # Save configuration files
-            if os.path.exists("config.py"):
-                shutil.copy("config.py", os.path.join(run_dir, f"config_{run_name}_{timestamp}.py"))
-            if os.path.exists("batch_run.py"):
-                shutil.copy("batch_run.py", os.path.join(run_dir, f"batch_run_{run_name}_{timestamp}.py"))
-            
-            run_end_time = time.time()
-            runtime = (run_end_time - run_start_time) / 60
-            
-            logging.info(f"Runtime: {runtime:.2f} minutes")
-            
-            results_summary.append({
-                'index': idx,
-                'name': run_name,
-                'suffix': name_suffix,
-                'runtime': runtime,
-                'status': 'SUCCESS',
-                'dir': run_dir
+
+            # Save merged config snapshot
+            with open(os.path.join(run_dir, "config.py"), 'w') as f:
+                f.write("# Auto-generated merged config for this combination\n")
+                f.write(f"# Base: {config_name or 'config.py'}\n")
+                f.write(f"# Overrides: {json.dumps({k: str(v) for k, v in param_combo.items() if k != 'name_suffix'})}\n\n")
+                for k, v in params.items():
+                    f.write(f"{k} = {repr(v)}\n")
+
+            runtime = (time.time() - run_start) / 60
+            logging.info(f"Runtime: {runtime:.2f} min")
+            results.append({
+                'idx': idx, 'name': run_name,
+                'runtime': runtime, 'status': 'SUCCESS'
             })
-            
-            print(f"\n✓ Simulation {idx} completed successfully in {runtime:.2f} minutes")
-            
+            print(f"Done in {runtime:.2f} min")
+
         except Exception as e:
-            run_end_time = time.time()
-            runtime = (run_end_time - run_start_time) / 60
-            
-            error_msg = f"ERROR in simulation {idx}: {str(e)}"
-            logging.error(error_msg)
-            print(f"\n✗ {error_msg}")
-            
-            results_summary.append({
-                'index': idx,
-                'name': run_name,
-                'suffix': name_suffix,
-                'runtime': runtime,
-                'status': 'FAILED',
-                'error': str(e),
-                'dir': run_dir
+            runtime = (time.time() - run_start) / 60
+            logging.error(f"FAILED: {e}")
+            results.append({
+                'idx': idx, 'name': run_name,
+                'runtime': runtime, 'status': 'FAILED', 'error': str(e)
             })
-    
-    # Batch completion summary
-    batch_end_time = time.time()
-    total_runtime = (batch_end_time - batch_start_time) / 60
-    
-    print("\n" + "="*60)
-    print("BATCH RUN COMPLETED")
-    print("="*60)
-    print(f"\nTotal simulations: {len(param_combinations)}")
-    print(f"Successful: {sum(1 for r in results_summary if r['status'] == 'SUCCESS')}")
-    print(f"Failed: {sum(1 for r in results_summary if r['status'] == 'FAILED')}")
-    print(f"Total runtime: {total_runtime:.2f} minutes ({total_runtime/60:.2f} hours)")
-    print("\nResults summary:")
-    print("-" * 60)
-    
-    for result in results_summary:
-        status_symbol = "✓" if result['status'] == 'SUCCESS' else "✗"
-        print(f"{status_symbol} [{result['index']:2d}] {result['suffix']:20s} - "
-              f"{result['runtime']:6.2f} min - {result['status']}")
-        if result['status'] == 'FAILED':
-            print(f"    Error: {result.get('error', 'Unknown error')}")
-    
-    print("-" * 60)
-    
-    # Save summary to file
-    summary_dir = os.path.join("../../Simulations/Batch", f"batch_{base_timestamp}_{base_name}")
-    os.makedirs(summary_dir, exist_ok=True)
-    
-    summary_file = os.path.join(summary_dir, "batch_summary.txt")
-    with open(summary_file, 'w') as f:
-        f.write("BATCH RUN SUMMARY\n")
-        f.write("="*60 + "\n\n")
-        f.write(f"Base name: {base_name}\n")
-        f.write(f"Timestamp: {base_timestamp}\n")
-        f.write(f"Naming mode: {BATCH_NAMING_MODE}\n")
-        f.write(f"Total simulations: {len(param_combinations)}\n")
-        f.write(f"Successful: {sum(1 for r in results_summary if r['status'] == 'SUCCESS')}\n")
-        f.write(f"Failed: {sum(1 for r in results_summary if r['status'] == 'FAILED')}\n")
-        f.write(f"Total runtime: {total_runtime:.2f} minutes ({total_runtime/60:.2f} hours)\n\n")
-        f.write("Individual results:\n")
-        f.write("-"*60 + "\n")
-        
-        for result in results_summary:
-            f.write(f"\n[{result['index']:2d}] {result['name']}\n")
-            f.write(f"    Suffix: {result['suffix']}\n")
-            f.write(f"    Status: {result['status']}\n")
-            f.write(f"    Runtime: {result['runtime']:.2f} minutes\n")
-            f.write(f"    Directory: {result['dir']}\n")
-            if result['status'] == 'FAILED':
-                f.write(f"    Error: {result.get('error', 'Unknown error')}\n")
-    
-    print(f"\nBatch summary saved to: {summary_file}")
-    print("="*60 + "\n")
+            print(f"FAILED: {e}")
+
+    # Summary
+    total_runtime = (time.time() - batch_start) / 60
+    n_ok   = sum(1 for r in results if r['status'] == 'SUCCESS')
+    n_fail = sum(1 for r in results if r['status'] == 'FAILED')
+
+    print("\n" + "=" * 60)
+    print("BATCH COMPLETE")
+    print(f"  Success: {n_ok}   Failed: {n_fail}")
+    print(f"  Total:   {total_runtime:.1f} min ({total_runtime/60:.2f} h)")
+    print(f"  Folder:  {batch_root}")
+    print("=" * 60 + "\n")
+
+    summary_path = os.path.join(batch_root, "batch_summary.txt")
+    with open(summary_path, 'w') as f:
+        f.write("BATCH SUMMARY\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Base name:   {base_name}\n")
+        f.write(f"Type:        {'IRYSS' if iryss_meta else 'Sandbox'}\n")
+        if iryss_meta:
+            f.write(f"Source:      {iryss_meta['source']}\n")
+            f.write(f"Opacity:     {iryss_meta['opacity']}\n")
+            f.write(f"Inclination: {iryss_meta['inclination']}°\n")
+        f.write(f"Base config: {config_name or 'config.py'}\n")
+        f.write(f"Timestamp:   {base_timestamp}\n")
+        f.write(f"Total runs:  {len(param_combinations)}\n")
+        f.write(f"Success:     {n_ok}\n")
+        f.write(f"Failed:      {n_fail}\n")
+        f.write(f"Total time:  {total_runtime:.1f} min\n\n")
+        f.write("-" * 60 + "\n")
+        for r in results:
+            symbol = "OK" if r['status'] == 'SUCCESS' else "FAIL"
+            f.write(f"[{symbol}] {r['name']:30s}  {r['runtime']:6.2f} min\n")
+            if r['status'] == 'FAILED':
+                f.write(f"      Error: {r.get('error', '?')}\n")
+
+    print(f"Summary saved to: {summary_path}")
 
 
 if __name__ == "__main__":
-    print("This module is meant to be called from main.py")
-    print("Please run: python main.py")
+    print("This module is called from main.py - run: python main.py")

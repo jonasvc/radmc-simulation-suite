@@ -11,9 +11,18 @@ import importlib.util
 # Available reference configurations
 REFERENCE_CONFIGS = {
     'baseline': 'config_baseline.py',
+    'shadow': 'config_shadow.py',
+    'shadow_baseline': 'config_baseline_asym.py',
     'spiral': 'config_spiral.py',
     'vortex': 'config_vortex.py',
+    'spiral_phys': 'spiral_structure.py',
+    'vortex_phys': 'vortex_structure.py',
+    'gap_phys': 'gap_structure.py',
+    'warp_phys': 'warped_structure.py',
+    'planet': 'config_montesinos_cpd.py',
     'combined': 'config_combined.py',
+    'lowgrid': 'config_baseline_asym_grid.py',
+    'Matter': 'config_baseline_asym_Matter.py',
 }
 
 
