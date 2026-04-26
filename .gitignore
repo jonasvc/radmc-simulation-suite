@@ -1,1 +1,90 @@
-single_run.py
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+ENV/
+.ipynb_checkpoints/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+tmp/
+temp/
+cache/
+.cache/
+
+# Local configuration / secrets
+.env
+.env.*
+local_config.yaml
+config.local.yaml
+secrets.yaml
+
+# Project outputs
+outputs/
+results/
+plots/
+figures/generated/
+runs/
+simulations/
+
+# RADMC-3D generated outputs / inputs that are usually regenerated
+*.out
+image.out
+spectrum.out
+dust_temperature.dat
+dust_density.inp
+amr_grid.inp
+stars.inp
+wavelength_micron.inp
+camera_wavelength_micron.inp
+radmc3d.inp
+radmc3d.out
+
+# Large scientific data files
+*.fits
+*.fit
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.vti
+*.vtk
+
+# Generated images / figures
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.pdf
+
+# Cluster / scheduler logs
+slurm-*.out
+*.err
+*.stdout
+*.stderr
+
+# Jupyter
+.ipynb_checkpoints/
