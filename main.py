@@ -136,6 +136,10 @@ def get_user_inputs():
     choice = input("Please choose 1, 2 or 3: ").strip()
     reference_sed = {"1": "ABAur_Dominik.txt", "2": "ABAur_Dullemond.txt"}.get(choice)
 
+    # Smart grid builder
+    print("\n--- Grid Configuration ---")
+    use_smart_grid = input("Use smart grid builder? (y/n): ").strip().lower() == 'y'
+
     return {
         'name':            name,
         'iryss_meta':      iryss_meta,
@@ -146,6 +150,7 @@ def get_user_inputs():
         'reference_sed':   reference_sed,
         'run_mode':        run_mode,
         'ui_mode':         ui_mode,
+        'use_smart_grid':  use_smart_grid,
     }
 
 
@@ -203,6 +208,11 @@ def run_single_mode(user_inputs, timestamp):
 
     params = get_params_dict(config)
 
+    smart_grid_params = None
+    if user_inputs.get('use_smart_grid', False):
+        from grid_builder import build_smart_grid
+        smart_grid_params = build_smart_grid(params, verbose=True)
+
     from naming import generate_run_directory, determine_category
     run_dir, run_name = generate_run_directory(
         SIMULATIONS_ROOT, name, params, timestamp,
@@ -237,6 +247,7 @@ def run_single_mode(user_inputs, timestamp):
         wavelength=wavelength,
         threads=params['threads'],
         ui_mode=ui_mode,
+        smart_grid_params=smart_grid_params,
     )
 
     create_all_plots(

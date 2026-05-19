@@ -12,9 +12,12 @@ import time
 import subprocess
 import shlex
 import re
+import ast
+import struct
 from contextlib import contextmanager
 from radmc3dPy import analyze, setup, image
 from terminal_ui import print_success, print_error
+from streaming_density import problem_setup_dust_streaming, should_stream_density
 
 
 # ===========================================================================
@@ -22,6 +25,152 @@ from terminal_ui import print_success, print_error
 # ===========================================================================
 
 IGNORE_RADMC_ERROR_LINES_IF_RETURN_OK = True
+
+
+def _as_count(value):
+    """Return the total cell count for a radmc3dPy grid count parameter."""
+    if isinstance(value, (list, tuple)):
+        return int(sum(value))
+    return int(value)
+
+
+def _list_length_from_config_value(value):
+    if isinstance(value, (list, tuple)):
+        return len(value)
+    if isinstance(value, str):
+        try:
+            parsed = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return 1
+        if isinstance(parsed, (list, tuple)):
+            return len(parsed)
+    return 1
+
+
+def estimate_grid_memory(params):
+    nx = _as_count(params['nx'])
+    ny = _as_count(params['ny'])
+    nz = _as_count(params['nz'])
+    ncell = nx * ny * nz
+    nspec = max(
+        1,
+        _list_length_from_config_value(params.get('mixabun', [1.0])),
+        _list_length_from_config_value(params.get('dustkappa', [1.0])),
+    )
+
+    # Lower-bound estimate for the dominant resident arrays used by the Python
+    # setup and RADMC-3D thermal MC. Temporary arrays can push this higher.
+    bytes_per_double = 8
+    python_density_arrays = 5 * ncell * bytes_per_double
+    dust_species_arrays = 2 * nspec * ncell * bytes_per_double
+    radmc_core_arrays = (2 * nspec + 4) * ncell * bytes_per_double
+    lower_bound_gib = (
+        python_density_arrays + dust_species_arrays + radmc_core_arrays
+    ) / 1024.0**3
+
+    return {
+        'nx': nx,
+        'ny': ny,
+        'nz': nz,
+        'ncell': ncell,
+        'nspec': nspec,
+        'lower_bound_gib': lower_bound_gib,
+    }
+
+
+def log_grid_memory_estimate(params):
+    estimate = estimate_grid_memory(params)
+    msg = (
+        "Grid estimate: "
+        f"{estimate['nx']} x {estimate['ny']} x {estimate['nz']} = "
+        f"{estimate['ncell']:,} cells, "
+        f"~{estimate['lower_bound_gib']:.1f} GiB lower-bound working memory"
+    )
+    print(msg)
+    logging.info(msg)
+
+    if estimate['ncell'] > 100_000_000:
+        warning = (
+            "WARNING: This grid is very large for a single-node RADMC-3D run. "
+            "Expect setup and mctherm memory use to be substantially above the estimate."
+        )
+        print(warning)
+        logging.warning(warning)
+
+    return estimate
+
+
+def validate_radmc_input_files(params):
+    """Check the generated RADMC-3D input files before launching mctherm."""
+    required_files = [
+        "amr_grid.inp",
+        "wavelength_micron.inp",
+        "stars.inp",
+        "dustopac.inp",
+        "radmc3d.inp",
+        "dust_density.binp",
+    ]
+    missing = [fname for fname in required_files if not os.path.exists(fname)]
+    if missing:
+        raise RuntimeError("Missing RADMC-3D input files: " + ", ".join(missing))
+
+    empty = [fname for fname in required_files if os.path.getsize(fname) == 0]
+    if empty:
+        raise RuntimeError("Empty RADMC-3D input files: " + ", ".join(empty))
+
+    ncell_expected = (
+        _as_count(params['nx']) *
+        _as_count(params['ny']) *
+        _as_count(params['nz'])
+    )
+    with open("dust_density.binp", "rb") as rfile:
+        header = rfile.read(32)
+    if len(header) != 32:
+        raise RuntimeError("dust_density.binp is too small to contain a valid binary header")
+
+    iformat, precision, ncell, nspec = struct.unpack("=qqqq", header)
+    if iformat != 1:
+        raise RuntimeError(f"dust_density.binp has unsupported iformat={iformat}; expected 1")
+    if precision not in (4, 8):
+        raise RuntimeError(f"dust_density.binp has unsupported precision={precision}; expected 4 or 8")
+    if ncell != ncell_expected:
+        raise RuntimeError(
+            f"dust_density.binp cell count {ncell:,} does not match grid {ncell_expected:,}"
+        )
+    if nspec < 1:
+        raise RuntimeError(f"dust_density.binp has invalid dust species count nspec={nspec}")
+
+    expected_size = 32 + ncell * nspec * precision
+    actual_size = os.path.getsize("dust_density.binp")
+    if actual_size != expected_size:
+        raise RuntimeError(
+            "dust_density.binp size mismatch: "
+            f"expected {expected_size:,} bytes from header, found {actual_size:,} bytes"
+        )
+
+    msg = (
+        "RADMC input check: dust_density.binp "
+        f"ncell={ncell:,}, nspec={nspec}, precision={precision}, "
+        f"size={actual_size / 1024.0**3:.2f} GiB"
+    )
+    print(msg)
+    logging.info(msg)
+
+
+def validate_mctherm_output():
+    """Fail early if RADMC-3D returned without writing a usable temperature file."""
+    fname = "dust_temperature.bdat"
+    if not os.path.exists(fname):
+        raise RuntimeError(
+            "RADMC-3D mctherm finished/returned without creating dust_temperature.bdat. "
+            "This usually means RADMC-3D stopped before the photon loop, often during "
+            "large-grid memory allocation. Check the RADMC lines in log.txt and the "
+            "cluster stderr/OOM status."
+        )
+    size = os.path.getsize(fname)
+    if size == 0:
+        raise RuntimeError("RADMC-3D created an empty dust_temperature.bdat file")
+    logging.info(f"[MCTHERM_OUTPUT] {fname} size={size:,} bytes")
 
 
 def log_phase_start(phase_name):
@@ -95,9 +244,30 @@ class RawTracker:
 ### RADMC-3D COMMAND EXECUTION
 #################################################################
 
-def run_radmc_command(command_str, tracker, total_photons=None):
+def build_radmc_env(params):
+    """Build environment overrides for RADMC-3D/OpenMP runs."""
+    env = os.environ.copy()
+    mapping = {
+        'omp_stacksize': 'OMP_STACKSIZE',
+        'omp_dynamic': 'OMP_DYNAMIC',
+        'omp_proc_bind': 'OMP_PROC_BIND',
+        'omp_places': 'OMP_PLACES',
+    }
+    for param_key, env_key in mapping.items():
+        if param_key in params and params[param_key] is not None:
+            value = str(params[param_key]).strip()
+            if value and value.lower() not in ('none', 'default', 'auto'):
+                env[env_key] = value
+    return env
+
+
+def run_radmc_command(command_str, tracker, total_photons=None, env=None):
     """Execute a RADMC-3D command with mode-dependent output handling."""
     log_command(command_str)
+    if env is not None:
+        for key in ('OMP_STACKSIZE', 'OMP_DYNAMIC', 'OMP_PROC_BIND', 'OMP_PLACES'):
+            if key in env:
+                logging.info(f"[ENV] {key}={env[key]}")
     cmd_start_time = time.time()
     cmd_args = shlex.split(command_str)
 
@@ -110,13 +280,14 @@ def run_radmc_command(command_str, tracker, total_photons=None):
     if isinstance(tracker, RawTracker):
         process = subprocess.Popen(
             cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1)
+            text=True, bufsize=1, env=env)
         all_output = []
         error_found = False
         error_msg = None
         with process.stdout:
             for line in iter(process.stdout.readline, ''):
                 print(line, end='')
+                logging.info("[RADMC] " + line.rstrip())
                 all_output.append(line)
                 if 'ERROR' in line.upper() and not error_found:
                     error_found = True
@@ -148,12 +319,13 @@ def run_radmc_command(command_str, tracker, total_photons=None):
 
     process = subprocess.Popen(
         cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1)
+        text=True, bufsize=1, env=env)
 
     with process.stdout:
         for line in iter(process.stdout.readline, ''):
             clean_line = line.strip()
             if clean_line:
+                logging.info("[RADMC] " + clean_line)
                 tracker.log(clean_line)
                 if 'ERROR' in clean_line.upper() and not error_found:
                     error_found = True
@@ -203,6 +375,7 @@ RADMC_TEMP_FILES = [
     "radmc3d.inp",
     "problem_params.inp",
     "ppdisk_complete.inp",   # default parfile written by radmc3dPy
+    "ppdisk_complete_amr.inp",
 ]
 
 
@@ -234,7 +407,8 @@ def cleanup_pipeline_dir():
 
 def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
                           make_image_cube=False,
-                          wavelength=2.2, threads=32, ui_mode='advanced'):
+                          wavelength=2.2, threads=32, ui_mode='advanced',
+                          smart_grid_params=None):
     """
     Run a single RADMC-3D simulation.
     Supports generation of Single Images and Spectral Image Cubes.
@@ -269,11 +443,14 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
 
         tracker.start_phase("Setup")
         phase_start = log_phase_start("Setup")
+        model_name = params.get('model_name', 'ppdisk_complete')
+        radmc3d_exe = params.get('radmc3d_exe', 'radmc3d')
+        radmc_env = build_radmc_env(params)
         if use_silencer:
             with suppress_output():
-                analyze.writeDefaultParfile('ppdisk_complete')
+                analyze.writeDefaultParfile(model_name)
         else:
-            analyze.writeDefaultParfile('ppdisk_complete')
+            analyze.writeDefaultParfile(model_name)
         log_phase_end("Setup", phase_start)
         tracker.complete_phase("Setup")
 
@@ -284,10 +461,18 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
         tracker.start_phase("Configure Model")
         phase_start = log_phase_start("Configure Model")
 
+        # Apply smart grid overrides if provided
+        effective_params = dict(params)
+        if smart_grid_params is not None:
+            for k in ('xbound', 'nx', 'ybound', 'ny', 'zbound', 'nz'):
+                effective_params[k] = smart_grid_params[k]
+
+        grid_estimate = log_grid_memory_estimate(effective_params)
+
         dust_setup_args = {
-            'xbound': params['xbound'], 'nx': params['nx'],
-            'ybound': params['ybound'], 'ny': params['ny'],
-            'zbound': params['zbound'], 'nz': params['nz'],
+            'xbound': effective_params['xbound'], 'nx': effective_params['nx'],
+            'ybound': effective_params['ybound'], 'ny': effective_params['ny'],
+            'zbound': effective_params['zbound'], 'nz': effective_params['nz'],
             'wbound': params['wbound'], 'nw': params['nw'],
             'rstar': params['rstar'], 'mstar': params['mstar'], 'tstar': params['tstar'],
             'istar_sphere': params['istar_sphere'],
@@ -340,15 +525,43 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
             'bgdens': params['bgdens'],
             'binary': True,
         }
+        for optional_key in ('grid_style', 'crd_sys', 'levelMaxLimit', 'threshold'):
+            if optional_key in params:
+                dust_setup_args[optional_key] = params[optional_key]
 
-        if use_silencer:
-            with suppress_output():
-                setup.problemSetupDust('ppdisk_complete', **dust_setup_args)
+        use_streaming_density, density_writer_reason = should_stream_density(
+            params=effective_params,
+            estimate=grid_estimate,
+            model_name=model_name,
+        )
+        density_writer_msg = (
+            "Density writer: "
+            + ("streaming/chunked" if use_streaming_density else "normal radmc3dPy")
+            + f" ({density_writer_reason})"
+        )
+        tracker.log(density_writer_msg)
+        logging.info(density_writer_msg)
+
+        if use_streaming_density:
+            streaming_kwargs = dict(dust_setup_args)
+            streaming_kwargs['chunk_nphi'] = params.get('density_chunk_nphi', 8)
+            streaming_kwargs['density_precision'] = params.get('density_binary_precision', 8)
+            if use_silencer:
+                with suppress_output():
+                    problem_setup_dust_streaming(model_name, **streaming_kwargs)
+            else:
+                problem_setup_dust_streaming(model_name, **streaming_kwargs)
         else:
-            setup.problemSetupDust('ppdisk_complete', **dust_setup_args)
+            if use_silencer:
+                with suppress_output():
+                    setup.problemSetupDust(model_name, **dust_setup_args)
+            else:
+                setup.problemSetupDust(model_name, **dust_setup_args)
 
         with open("radmc3d.inp", "a") as f:
             f.write(f"mc_scat_maxtauabs = {params['mc_scat_maxtauabs']}\n")
+
+        validate_radmc_input_files(effective_params)
 
         log_phase_end("Configure Model", phase_start)
         tracker.complete_phase("Configure Model")
@@ -360,8 +573,9 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
         tracker.start_phase("MC Thermal")
         phase_start = log_phase_start("MC Thermal")
         run_radmc_command(
-            f'radmc3d mctherm setthreads {threads} sloppy',
-            tracker, total_photons=params['nphot'])
+            f'{radmc3d_exe} mctherm setthreads {threads} sloppy',
+            tracker, total_photons=params['nphot'], env=radmc_env)
+        validate_mctherm_output()
         log_phase_end("MC Thermal", phase_start)
         tracker.complete_phase("MC Thermal")
 
@@ -372,8 +586,8 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
         tracker.start_phase("SED Calculation")
         phase_start = log_phase_start("SED Calculation")
         run_radmc_command(
-            f'radmc3d sed incl {params["incl"]} setthreads {threads} sloppy',
-            tracker, total_photons=params['nphot_spec'])
+            f'{radmc3d_exe} sed incl {params["incl"]} setthreads {threads} sloppy',
+            tracker, total_photons=params['nphot_spec'], env=radmc_env)
         log_phase_end("SED Calculation", phase_start)
         tracker.complete_phase("SED Calculation")
 
@@ -388,7 +602,7 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
             def compute_and_save(mode_type, lambda_arg, fits_prefix, png_prefix):
                 tracker.log(f"Computing {mode_type} ({lambda_arg})...")
                 logging.info(f"Computing {mode_type} using {lambda_arg}")
-                cmd = (f"radmc3d image "
+                cmd = (f"{radmc3d_exe} image "
                        f"npix {params['npix']} "
                        f"incl {params['incl']} "
                        f"sizeau {params['sizeau']} "
@@ -397,7 +611,7 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
                        f"setthreads {threads}")
                 if params['nostar']:
                     cmd += " nostar"
-                run_radmc_command(cmd, tracker)
+                run_radmc_command(cmd, tracker, env=radmc_env)
                 im = image.readImage()
                 fits_filename = f'{fits_prefix}_{name}_{timestamp}.fits'
                 im.writeFits(fits_filename, dpc=params['pc'])
