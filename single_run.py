@@ -17,7 +17,6 @@ import struct
 from contextlib import contextmanager
 from radmc3dPy import analyze, setup, image
 from terminal_ui import print_success, print_error
-from streaming_density import problem_setup_dust_streaming, should_stream_density
 
 
 # ===========================================================================
@@ -118,11 +117,14 @@ def validate_radmc_input_files(params):
     if empty:
         raise RuntimeError("Empty RADMC-3D input files: " + ", ".join(empty))
 
-    ncell_expected = (
-        _as_count(params['nx']) *
-        _as_count(params['ny']) *
-        _as_count(params['nz'])
-    )
+    # Read the actual cell count from amr_grid.inp — this is what radmc3dPy wrote
+    # and is always correct regardless of how many segments the grid has.
+    with open("amr_grid.inp", "r") as gfile:
+        for _ in range(5):          # skip: iformat, grid_style, coordsystem, gridinfo, active_dims
+            gfile.readline()
+        dims = gfile.readline().split()
+    ncell_expected = int(dims[0]) * int(dims[1]) * int(dims[2])
+
     with open("dust_density.binp", "rb") as rfile:
         header = rfile.read(32)
     if len(header) != 32:
@@ -236,7 +238,7 @@ class RawTracker:
     def complete_phase(self, name): print(f">>> Completed Phase: {name}\n")
     def log(self, msg): pass
     def set_phase_total(self, n): pass
-    def update_progress(self, n): pass
+    def update_progress(self, n, force=False): pass
     def print_summary(self): pass
 
 
@@ -261,7 +263,80 @@ def build_radmc_env(params):
     return env
 
 
-def run_radmc_command(command_str, tracker, total_photons=None, env=None):
+def _parse_positive_count(value):
+    """Parse RADMC-style count values such as 1e+7 into positive ints."""
+    if value is None:
+        return None
+    try:
+        count = int(float(str(value)))
+    except (TypeError, ValueError):
+        return None
+    return count if count > 0 else None
+
+
+def _sum_config_counts(value):
+    """Return the sum of scalar/list count values from config fields."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return _parse_positive_count(value)
+    if isinstance(value, (list, tuple)):
+        counts = [_parse_positive_count(v) for v in value]
+        if any(v is None for v in counts):
+            return None
+        return sum(counts)
+    return _parse_positive_count(value)
+
+
+def read_wavelength_count(filename="wavelength_micron.inp"):
+    """Read the first-line wavelength count from a RADMC-3D wavelength file."""
+    if not os.path.exists(filename):
+        return None
+    try:
+        with open(filename, "r") as rfile:
+            for line in rfile:
+                line = line.strip()
+                if line:
+                    return _parse_positive_count(line.split()[0])
+    except OSError as exc:
+        logging.warning(f"Could not read wavelength count from {filename}: {exc}")
+    return None
+
+
+def get_sed_wavelength_count(params):
+    """SED uses the global wavelength grid written to wavelength_micron.inp."""
+    return read_wavelength_count("wavelength_micron.inp") or _sum_config_counts(params.get("nw"))
+
+
+def get_camera_wavelength_count(params, is_cube):
+    """Return how many wavelengths a camera image command will process."""
+    if not is_cube:
+        return 1
+    return (
+        read_wavelength_count("camera_wavelength_micron.inp")
+        or read_wavelength_count("camera_frequency.inp")
+        or read_wavelength_count("wavelength_micron.inp")
+        or _sum_config_counts(params.get("nw"))
+        or 1
+    )
+
+
+def get_image_photon_progress_total(params, is_cube):
+    """Return total scattering photons expected for an image command."""
+    if _parse_positive_count(params.get("scattering_mode_max", 0)) is None:
+        return None
+    nphot_scat = _parse_positive_count(params.get("nphot_scat"))
+    if nphot_scat is None:
+        return None
+    return nphot_scat * get_camera_wavelength_count(params, is_cube)
+
+
+def run_radmc_command(command_str, tracker, total_photons=None, env=None,
+                      progress_total=None, progress_mode=None,
+                      photon_batch_total=None):
     """Execute a RADMC-3D command with mode-dependent output handling."""
     log_command(command_str)
     if env is not None:
@@ -306,16 +381,27 @@ def run_radmc_command(command_str, tracker, total_photons=None, env=None):
         return
 
     # ADVANCED MODE
-    if total_photons:
-        try:
-            safe_total = int(float(total_photons))
-            tracker.set_phase_total(safe_total)
-        except ValueError:
-            tracker.log(f"[yellow]Warning: Could not parse total_photons '{total_photons}'.[/yellow]")
+    if progress_mode is None and total_photons is not None:
+        progress_mode = "photon"
+    if progress_total is None:
+        progress_total = total_photons
+
+    safe_total = _parse_positive_count(progress_total)
+    if safe_total:
+        tracker.set_phase_total(safe_total)
+    elif progress_total is not None:
+        tracker.log(f"[yellow]Warning: Could not parse progress total '{progress_total}'.[/yellow]")
 
     photon_pattern = re.compile(r"Photon\s+nr[:.]?\s+(\d+)", re.IGNORECASE)
+    wavelength_nr_pattern = re.compile(r"Wavelength\s+nr\s+(\d+)", re.IGNORECASE)
+    raytrace_lambda_pattern = re.compile(r"Ray-tracing image for lambda\s*=", re.IGNORECASE)
+    spectrum_done_pattern = re.compile(r"Done rendering spectrum", re.IGNORECASE)
     error_found = False
     error_msg = None
+    photon_offset = 0
+    last_raw_photon = None
+    photon_batch_total = _parse_positive_count(photon_batch_total)
+    wavelength_step = 0
 
     process = subprocess.Popen(
         cmd_args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -330,14 +416,37 @@ def run_radmc_command(command_str, tracker, total_photons=None, env=None):
                 if 'ERROR' in clean_line.upper() and not error_found:
                     error_found = True
                     error_msg = clean_line
-                if total_photons:
+                if progress_mode == "photon" and safe_total:
                     match = photon_pattern.search(clean_line)
                     if match:
                         try:
                             current_photon = int(match.group(1))
-                            tracker.update_progress(current_photon)
                         except ValueError:
                             pass
+                        else:
+                            if last_raw_photon is not None and current_photon < last_raw_photon:
+                                photon_offset += photon_batch_total or last_raw_photon
+                            last_raw_photon = current_photon
+                            tracker.update_progress(min(photon_offset + current_photon, safe_total))
+                elif progress_mode == "wavelength" and safe_total:
+                    match = wavelength_nr_pattern.search(clean_line)
+                    if match:
+                        try:
+                            wavelength_index = int(match.group(1))
+                        except ValueError:
+                            pass
+                        else:
+                            # This line marks the start of wavelength N, so N-1 are complete.
+                            completed = max(wavelength_step, wavelength_index - 1)
+                            if completed > wavelength_step:
+                                wavelength_step = min(completed, safe_total)
+                                tracker.update_progress(wavelength_step, force=True)
+                    elif raytrace_lambda_pattern.search(clean_line):
+                        wavelength_step = min(wavelength_step + 1, safe_total)
+                        tracker.update_progress(wavelength_step, force=True)
+                    elif spectrum_done_pattern.search(clean_line):
+                        wavelength_step = safe_total
+                        tracker.update_progress(wavelength_step, force=True)
 
     return_code = process.wait()
     logging.info(f"[RETURN_CODE] {return_code}")
@@ -466,6 +575,17 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
         if smart_grid_params is not None:
             for k in ('xbound', 'nx', 'ybound', 'ny', 'zbound', 'nz'):
                 effective_params[k] = smart_grid_params[k]
+            # Scale nphot_scat up if the smart grid needs more photons than
+            # the config specifies.  The scattering source function (mean
+            # intensity J) requires ~10 MC hits per cell; fewer gives visible
+            # spoke artifacts in scattered-light images.
+            rec = smart_grid_params.get('nphot_scat_rec')
+            if rec is not None:
+                cfg_val = int(float(str(params.get('nphot_scat', 0))))
+                if cfg_val < rec:
+                    effective_params['nphot_scat'] = str(int(rec))
+                    logging.info(f"nphot_scat raised from {cfg_val:.2e} to {rec:.2e} "
+                                 f"to match smart grid cell count")
 
         grid_estimate = log_grid_memory_estimate(effective_params)
 
@@ -486,7 +606,7 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
             'dustkappa_ext': params['dustkappa'],
             'gsmax': params['gsmax'], 'gsmin': params['gsmin'],
             'mixabun': params['mixabun'],
-            'nphot': params['nphot'], 'nphot_scat': params['nphot_scat'],
+            'nphot': params['nphot'], 'nphot_scat': effective_params['nphot_scat'],
             'nphot_spec': params['nphot_spec'],
             'modified_random_walk': params['modified_random_walk'],
             'scattering_mode_max': params['scattering_mode_max'],
@@ -529,37 +649,16 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
             if optional_key in params:
                 dust_setup_args[optional_key] = params[optional_key]
 
-        use_streaming_density, density_writer_reason = should_stream_density(
-            params=effective_params,
-            estimate=grid_estimate,
-            model_name=model_name,
-        )
-        density_writer_msg = (
-            "Density writer: "
-            + ("streaming/chunked" if use_streaming_density else "normal radmc3dPy")
-            + f" ({density_writer_reason})"
-        )
-        tracker.log(density_writer_msg)
-        logging.info(density_writer_msg)
-
-        if use_streaming_density:
-            streaming_kwargs = dict(dust_setup_args)
-            streaming_kwargs['chunk_nphi'] = params.get('density_chunk_nphi', 8)
-            streaming_kwargs['density_precision'] = params.get('density_binary_precision', 8)
-            if use_silencer:
-                with suppress_output():
-                    problem_setup_dust_streaming(model_name, **streaming_kwargs)
-            else:
-                problem_setup_dust_streaming(model_name, **streaming_kwargs)
-        else:
-            if use_silencer:
-                with suppress_output():
-                    setup.problemSetupDust(model_name, **dust_setup_args)
-            else:
+        if use_silencer:
+            with suppress_output():
                 setup.problemSetupDust(model_name, **dust_setup_args)
+        else:
+            setup.problemSetupDust(model_name, **dust_setup_args)
 
         with open("radmc3d.inp", "a") as f:
             f.write(f"mc_scat_maxtauabs = {params['mc_scat_maxtauabs']}\n")
+            f.write(f"mcscat_phi_coarsen = {int(params.get('mcscat_phi_coarsen', 1))}\n")
+            f.write(f"mc_peeledoff = {int(params.get('mc_peeledoff', 0))}\n")
 
         validate_radmc_input_files(effective_params)
 
@@ -585,9 +684,13 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
 
         tracker.start_phase("SED Calculation")
         phase_start = log_phase_start("SED Calculation")
+        sed_wavelengths = get_sed_wavelength_count(params)
+        if sed_wavelengths:
+            tracker.log(f"Tracking SED wavelength progress over {sed_wavelengths} wavelengths.")
         run_radmc_command(
             f'{radmc3d_exe} sed incl {params["incl"]} setthreads {threads} sloppy',
-            tracker, total_photons=params['nphot_spec'], env=radmc_env)
+            tracker, progress_total=sed_wavelengths,
+            progress_mode="wavelength", env=radmc_env)
         log_phase_end("SED Calculation", phase_start)
         tracker.complete_phase("SED Calculation")
 
@@ -599,7 +702,7 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
             tracker.start_phase("Generate Image")
             phase_start = log_phase_start("Generate Image")
 
-            def compute_and_save(mode_type, lambda_arg, fits_prefix, png_prefix):
+            def compute_and_save(mode_type, lambda_arg, fits_prefix, png_prefix, is_cube=False):
                 tracker.log(f"Computing {mode_type} ({lambda_arg})...")
                 logging.info(f"Computing {mode_type} using {lambda_arg}")
                 cmd = (f"{radmc3d_exe} image "
@@ -611,7 +714,15 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
                        f"setthreads {threads}")
                 if params['nostar']:
                     cmd += " nostar"
-                run_radmc_command(cmd, tracker, env=radmc_env)
+                image_progress_total = get_image_photon_progress_total(effective_params, is_cube)
+                if image_progress_total:
+                    tracker.log(f"Tracking image scattering progress over {image_progress_total} photons.")
+                elif _parse_positive_count(effective_params.get('scattering_mode_max', 0)) is None:
+                    tracker.log("Image scattering is disabled; RADMC-3D will not emit image photon counts.")
+                run_radmc_command(
+                    cmd, tracker, total_photons=image_progress_total,
+                    photon_batch_total=effective_params.get('nphot_scat'),
+                    env=radmc_env)
                 im = image.readImage()
                 fits_filename = f'{fits_prefix}_{name}_{timestamp}.fits'
                 im.writeFits(fits_filename, dpc=params['pc'])
@@ -637,14 +748,16 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
                     mode_type="Single Image",
                     lambda_arg=f"lambda {wavelength}",
                     fits_prefix="Img",
-                    png_prefix="Image")
+                    png_prefix="Image",
+                    is_cube=False)
 
             if make_image_cube:
                 compute_and_save(
                     mode_type="Image Cube",
                     lambda_arg="loadlambda",
                     fits_prefix="ImgCube",
-                    png_prefix="ImageCube")
+                    png_prefix="ImageCube",
+                    is_cube=True)
 
             log_phase_end("Generate Image", phase_start)
             tracker.complete_phase("Generate Image")
