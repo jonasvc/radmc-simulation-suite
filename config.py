@@ -70,16 +70,33 @@ ny             = [10,90,90,10]
 zbound         = ["0.", "pi", "2*pi"]
 nz             = [180,180]
 
+### Density writer / large-grid setup ###
+
+# "auto" uses the chunked writer only when the estimated setup memory is large.
+# Use "normal" to force the original radmc3dPy full-array writer, or "chunked"
+# to force streaming dust_density.binp generation.
+density_writer = "auto"
+density_writer_auto_min_cells = 20000000
+density_writer_auto_min_gib = 8.0
+density_chunk_nphi = 8
+density_binary_precision = 8
+
 ### Computational Parameters ###
 
+radmc3d_exe     = 'radmc3d'         # Set to a patched executable path if needed
+omp_stacksize   = None              # Leave OpenMP stack at runtime default unless explicitly needed
+omp_dynamic     = 'FALSE'           # Keep RADMC-3D at the requested setthreads value
+omp_proc_bind   = 'close'           # Keep OpenMP threads near their parent thread
+omp_places      = 'cores'           # Bind OpenMP threads to CPU cores where supported
 nphot          = '1e+7'            # Number of Photons for the Monte-Carlo run
 nphot_scat     = '1e+8'            # Number of Photons for Scattering
 nphot_spec     = '1e+5'            # Number of Photons for the SED 
 threads        = 32                # Number of Processor Threads to use
 modified_random_walk = 1           # Enable/Disable Modified random walk 
 scattering_mode_max = 0            # Scattering Mode (0=None, 1=Isotropic, 2=Anisotropic)
-mc_scat_maxtauabs = 30             # Maximum number of times a photon gets absorbed before being destroyed 
-
+mc_scat_maxtauabs = 30             # Maximum number of times a photon gets absorbed before being destroyed
+mcscat_phi_coarsen = 4             # Average scatsrc over N phi cells to suppress spoke artifacts (1=off, set 240 for full axisym collapse)
+mc_peeledoff       = 0             # 0=off (use cell-binned MC source). 1=on (peeled-off next-event estimator: scattering events deposit directly to image, no cell-level Poisson noise; preserves azimuthal asymmetries unlike mcscat_phi_coarsen)
 ### Image Parameters (VLTI Standart for AT) ###
 
 npix           = 2200              # Number of pixels on the rectangular images
