@@ -26,30 +26,46 @@ This is an alpha release. The workflow is usable for research runs, but paths, d
 ## Workflow
 
 ```mermaid
-flowchart LR
-    C[Config] --> S[Setup]
-    S --> R[RADMC inputs]
-    R --> M[mctherm]
-    M --> E[SED]
-    E --> I[Image or cube]
-    I --> P[Plots and FITS]
-    P --> L[Run folder and logbook]
+flowchart TD
+    subgraph input [" Input "]
+        A["Config .py"]
+    end
+
+    subgraph setup [" Setup "]
+        B["RADMC-3D input files"]
+    end
+
+    subgraph compute [" Compute "]
+        C["Thermal Monte-Carlo\n(mctherm)"]
+        D["SED"]
+        E["Image / cube"]
+    end
+
+    subgraph output [" Output "]
+        F["Plots and FITS"]
+        G["Run folder  +  logbook"]
+    end
+
+    A --> B --> C
+    C --> D --> F
+    C --> E --> F
+    F --> G
 ```
 
 ## At A Glance
 
 | Part | What it does |
-| --- | --- |
-| Config system | Uses Python configs for stellar, disk, dust, grid, image, and Monte-Carlo parameters |
-| RADMC runner | Executes setup, thermal Monte-Carlo, SED, image, and cube phases |
-| Progress UI | Shows phase progress, photon progress, and wavelength progress |
-| Smart grid | Builds non-uniform spherical grids from active disk structures |
-| Large-grid checks | Estimates memory use and validates key RADMC input and output files |
-| Batch mode | Runs parameter sweeps with separate output folders |
-| Plotting | Produces SED, density, temperature, and combined diagnostic plots |
-| Logbook | Records parameters, runtime, status, errors, and run locations |
-| Interferometry | Computes visibilities, closure phases, and UV coverage from image output |
-| Analysis GUI | Opens completed runs and combines plotting with interferometry tools |
+|------|-------------|
+| Config system | Python configs for stellar, disk, dust, grid, image, and Monte-Carlo parameters |
+| RADMC runner | Setup, thermal MC, SED, image, and cube phases |
+| Progress UI | Phase, photon, and wavelength progress bars |
+| Smart grid | Density-adaptive spherical grid from the active config structures |
+| Large-grid checks | Memory estimates and validation of key RADMC input and output files |
+| Batch mode | Parameter sweeps with separate output folders per run |
+| Plotting | SED, density, temperature, and combined diagnostic plots |
+| Logbook | Parameters, runtime, status, errors, and run locations |
+| Interferometry | Visibilities, closure phases, and UV coverage from image output |
+| Analysis GUI | Inspect runs, plot diagnostics, and run interferometry tools |
 
 ## Disk Model Features
 
@@ -245,20 +261,20 @@ setthreads
 
 ## Main Files
 
-| Path | Purpose |
-| --- | --- |
+| File | Purpose |
+|------|---------|
 | `main.py` | Interactive launcher |
 | `single_run.py` | Core RADMC run workflow |
 | `batch_run.py` | Parameter sweep runner |
 | `config.py` | Default simulation config |
 | `configs/` | Reference and example configs |
-| `config_loader.py` | Default, reference, and custom config loading |
-| `grid_builder.py` | Smart spherical grid builder |
+| `config_loader.py` | Config loading (default, reference, custom) |
+| `grid_builder.py` | Density-adaptive spherical grid builder |
 | `plots.py` | SED, density, and temperature plots |
 | `export.py` | Simulation logbook writer |
-| `view_logbook.py` | Logbook view, search, and export helper |
+| `view_logbook.py` | Logbook view, search, and CSV export |
 | `interferometry.py` | Visibility and closure-phase tools |
-| `radmc_analysis_gui_with_interfero.py` | Analysis GUI with interferometry tools |
+| `radmc_analysis_gui_with_interfero.py` | Analysis GUI with interferometry |
 
 ## Requirements
 
