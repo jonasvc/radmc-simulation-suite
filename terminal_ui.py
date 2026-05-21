@@ -275,12 +275,13 @@ class AdvancedPhaseTracker:
         self.progress.update(self.phase_task, total=total_steps, completed=0)
         self.last_reported_step = 0
 
-    def update_progress(self, step):
+    def update_progress(self, step, force=False):
         """Update progress."""
         task = self.progress.tasks[self.phase_task]
         
         if task.total is not None:
-            if step - self.last_reported_step >= self.update_interval:
+            small_total = task.total <= self.update_interval
+            if force or small_total or step - self.last_reported_step >= self.update_interval:
                 self.progress.update(self.phase_task, completed=step)
                 self.last_reported_step = step
                 
@@ -315,7 +316,6 @@ class AdvancedPhaseTracker:
         
         self.progress.update(self.phase_task, total=final_total, completed=final_total)
         self.progress.update(self.overall_task, completed=self.current_phase_idx + 1)
-        self.progress.update(self.phase_task, completed=100)
 
     def get_total_time(self):
         return time.time() - self.start_time
