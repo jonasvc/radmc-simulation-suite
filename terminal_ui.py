@@ -13,8 +13,13 @@ from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, ProgressColumn, Task, TimeRemainingColumn
 from rich.text import Text
 from rich import box
+from rich.panel import Panel
 
 console = Console()
+
+SUITE_NAME = "RADMC ProtoDisk Suite"
+SUITE_VERSION = "v0.1-alpha"
+SUITE_SUBTITLE = "RADMC-3D protoplanetary disk workflow"
 
 
 # ===========================================================================
@@ -49,15 +54,17 @@ def get_gradient_color(percentage):
 # ===========================================================================
 
 def print_banner(mode, name, category, timestamp):
-    """Print fancy banner at start"""
-    banner_text = """
-[bold cyan]╔══════════════════════════════════════════════════════════╗
-║          RADMC-3D Simulation Pipeline v1.0               ║
-║          Protoplanetary Disk Modeling                    ║
-╚══════════════════════════════════════════════════════════╝[/bold cyan]
-"""
-    console.print(banner_text)
-    
+    """Print the suite banner and run identity."""
+    console.print(
+        Panel.fit(
+            f"[bold cyan]{SUITE_NAME}[/bold cyan] [bold yellow]{SUITE_VERSION}[/bold yellow]\n"
+            f"[white]{SUITE_SUBTITLE}[/white]",
+            border_style="cyan",
+            box=box.ASCII,
+            padding=(1, 4),
+        )
+    )
+
     info_table = Table(show_header=False, box=None, padding=(0, 2))
     info_table.add_column(style="cyan")
     info_table.add_column(style="white")
@@ -72,24 +79,56 @@ def print_banner(mode, name, category, timestamp):
     console.print()
 
 
+def print_pre_run_summary(run_name, config_name, run_dir, ui_mode, seconds=5):
+    """Show the resolved run setup briefly before RADMC starts."""
+    output_folder = os.path.basename(run_dir.rstrip(os.sep)) or run_dir
+
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(style="cyan", no_wrap=True)
+    table.add_column(style="white", no_wrap=True)
+
+    table.add_row("Run", run_name)
+    table.add_row("Config", config_name or "config.py")
+    table.add_row("Folder", output_folder)
+    table.add_row("UI", ui_mode)
+
+    console.print(
+        Panel.fit(
+            table,
+            title=f"[bold cyan]{SUITE_NAME}[/bold cyan] [bold yellow]{SUITE_VERSION}[/bold yellow]",
+            subtitle=f"Starting in {seconds} seconds",
+            border_style="bright_green",
+            box=box.ASCII,
+            padding=(1, 2),
+        )
+    )
+    time.sleep(seconds)
+    console.print()
+
+
 def print_success(message):
-    console.print(f"[bold bright_green]✓[/bold bright_green] [bright_green]{message}[/bright_green]")
+    console.print(f"[bold bright_green]OK[/bold bright_green] [bright_green]{message}[/bright_green]")
+    return
 
 
 def print_warning(message):
-    console.print(f"[yellow]⚠[/yellow] {message}")
+    console.print(f"[yellow]WARN[/yellow] {message}")
+    return
 
 
 def print_error(message):
-    console.print(f"[red]✗[/red] {message}")
+    console.print(f"[red]ERR[/red] {message}")
+    return
 
 
 def print_info(message):
-    console.print(f"[cyan]→[/cyan] {message}")
+    console.print(f"[cyan]->[/cyan] {message}")
+    return
 
 
 def print_separator():
-    console.print("[dim]" + "─" * 60 + "[/dim]")
+    console.print("[dim]" + "-" * 60 + "[/dim]")
+    return
 
 
 def print_parameter_table(params, show_all=False):
@@ -147,12 +186,12 @@ class ZeroPulseBarColumn(BarColumn):
     'Pulse/Scanner' animation instead of an empty bar.
     """
     def render(self, task: Task):
-        # Wenn Total unbekannt ist ODER noch keine Schritte gemacht wurden (0 completed)
-        # dann simulieren wir den Scanner (Pulse), indem wir so tun, als wäre total=None.
+        # Unknown totals or zero progress use the pulse animation.
+        # This keeps the bar visibly active before the first update.
         if task.total is None or task.completed == 0:
             return super().render(task_copy_with_total_none(task))
         
-        # Sobald completed > 0 ist, verhalten wir uns wie ein normaler Balken
+        # Once progress exists, render the normal bar.
         return super().render(task)
 
 def task_copy_with_total_none(task):
@@ -226,7 +265,7 @@ class AdvancedPhaseTracker:
             SpinnerColumn(),
             TextColumn("[bold blue]{task.description}"),
             
-            # HIER GEÄNDERT: pulse_style="bold bright_green" für den grünen Scanner
+            # Pulse style for the active phase bar.
             ZeroPulseBarColumn(bar_width=40, pulse_style="bold bright_green"),
             
             SmartPercentageColumn(),
@@ -302,14 +341,14 @@ class AdvancedPhaseTracker:
         self.progress.reset(self.phase_task)
         self.progress.update(self.phase_task, description=desc, total=None, visible=True)
         
-        self.log(f"[bold bright_green]→[/bold bright_green] Starting: [bold bright_green]{phase_name}[/bold bright_green]")
+        self.log(f"[bold bright_green]->[/bold bright_green] Starting: [bold bright_green]{phase_name}[/bold bright_green]")
 
     def complete_phase(self, phase_name):
         if self.phase_start_time:
             duration = time.time() - self.phase_start_time
             self.phase_times[phase_name] = duration
             duration_str = f"{int(duration)}s"
-            self.log(f"[bold bright_green]✓[/bold bright_green] Done: [bold]{phase_name}[/bold] [bright_green]({duration_str})[/bright_green]")
+            self.log(f"[bold bright_green]OK[/bold bright_green] Done: [bold]{phase_name}[/bold] [bright_green]({duration_str})[/bright_green]")
         
         task = self.progress.tasks[self.phase_task]
         final_total = task.total if task.total else 100

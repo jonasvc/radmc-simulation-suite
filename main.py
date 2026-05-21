@@ -11,7 +11,7 @@ import time
 import shutil
 from single_run import run_single_simulation
 from plots import create_all_plots
-from terminal_ui import print_banner, print_success, print_error, print_system_info, print_parameter_table
+from terminal_ui import print_banner, print_success, print_error, print_system_info, print_parameter_table, print_pre_run_summary
 
 # Root directory for all simulation output
 SIMULATIONS_ROOT = "/home/main/RADMC/Simulations"
@@ -139,6 +139,15 @@ def get_user_inputs():
     # Smart grid builder
     print("\n--- Grid Configuration ---")
     use_smart_grid = input("Use smart grid builder? (y/n): ").strip().lower() == 'y'
+    grid_threshold = 0.1
+    if use_smart_grid:
+        raw = input("  Density threshold [0.1]  (max |Δln ρ| per cell, e.g. 0.05–0.3): ").strip()
+        if raw:
+            try:
+                grid_threshold = float(raw)
+            except ValueError:
+                print("  Invalid value, using default 0.1.")
+                grid_threshold = 0.1
 
     return {
         'name':            name,
@@ -151,6 +160,7 @@ def get_user_inputs():
         'run_mode':        run_mode,
         'ui_mode':         ui_mode,
         'use_smart_grid':  use_smart_grid,
+        'grid_threshold':  grid_threshold,
     }
 
 
@@ -211,7 +221,11 @@ def run_single_mode(user_inputs, timestamp):
     smart_grid_params = None
     if user_inputs.get('use_smart_grid', False):
         from grid_builder import build_smart_grid
-        smart_grid_params = build_smart_grid(params, verbose=True)
+        smart_grid_params = build_smart_grid(
+            params,
+            threshold=user_inputs.get('grid_threshold', 0.1),
+            verbose=True,
+        )
 
     from naming import generate_run_directory, determine_category
     run_dir, run_name = generate_run_directory(
@@ -234,6 +248,14 @@ def run_single_mode(user_inputs, timestamp):
         logging.info(f"IRYSS source:      {iryss_meta['source']}")
         logging.info(f"IRYSS opacity:     {iryss_meta['opacity']}")
         logging.info(f"IRYSS inclination: {iryss_meta['inclination']}")
+
+    print_pre_run_summary(
+        run_name=run_name,
+        config_name=config_name or 'config.py',
+        run_dir=run_dir,
+        ui_mode=ui_mode,
+        seconds=5,
+    )
 
     start_time = time.time()
 
@@ -277,7 +299,8 @@ def run_single_mode(user_inputs, timestamp):
 
 def main():
     print("\n" + "=" * 60)
-    print("RADMC-3D Simulation Suite")
+    print("RADMC ProtoDisk Suite v0.1-alpha")
+    print("RADMC-3D protoplanetary disk workflow")
     print("=" * 60 + "\n")
 
     user_inputs = get_user_inputs()

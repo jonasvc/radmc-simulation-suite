@@ -1,19 +1,21 @@
 """
 Smart adaptive grid builder for RADMC-3D disk simulations.
 
-Builds an optimal non-uniform spherical r x theta x phi grid that concentrates
-resolution only where active structures require it.  For inactive (zero-amplitude)
-structures the corresponding resolution overhead is zero.
+Evaluates the dust density model on a coarse probe grid, measures the actual
+|delta ln rho| gradient in r, theta, and phi, then marches to place cell
+interfaces so that every cell satisfies |delta ln rho| <= threshold.
+
+No analytical slope guessing or structure-specific heuristics.  If the density
+changes steeply somewhere, the grid resolves it; if it is flat, cells are coarse.
 
 Public API
 ----------
-build_smart_grid(ppar, verbose=True) -> dict
-    Main entry point.  Returns a dict with keys
-    xbound, nx, ybound, ny, zbound, nz  (ready to pass to problemSetupDust).
+build_smart_grid(ppar, threshold=0.1, verbose=True) -> dict
+    Returns {xbound, nx, ybound, ny, zbound, nz} ready for problemSetupDust.
 
 CLI
 ---
-python grid_builder.py --config config_baseline_asym.py [--dry-run] [--plot]
+python grid_builder.py --config config.py [--threshold 0.05] [--dry-run] [--plot]
 """
 
 from __future__ import print_function
@@ -28,10 +30,10 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Physical constants (CGS)
 # ---------------------------------------------------------------------------
-AU  = 1.496e13   # cm
+AU  = 1.496e13
 PI  = np.pi
-MS  = 1.989e33   # g
-RS  = 6.96e10    # cm
+MS  = 1.989e33
+RS  = 6.96e10
 
 _EVAL_NS = {'au': AU, 'AU': AU, 'pi': PI, 'PI': PI,
              'ms': MS, 'MS': MS, 'rs': RS, 'RS': RS, 'np': np}
@@ -42,7 +44,6 @@ _EVAL_NS = {'au': AU, 'AU': AU, 'pi': PI, 'PI': PI,
 # ---------------------------------------------------------------------------
 
 def _ev(val):
-    """Evaluate a param value that may be a string expression or numeric."""
     if isinstance(val, bool):
         return val
     if isinstance(val, (int, float)):
@@ -58,7 +59,6 @@ def _ev(val):
 
 
 def _ev_list(val, default=None):
-    """Evaluate to a flat list of floats."""
     if val is None:
         return [0.0] if default is None else default
     result = _ev(val)
@@ -71,7 +71,6 @@ def _ev_list(val, default=None):
 
 
 def _nonzero(val):
-    """True if any element is non-zero."""
     try:
         arr = np.atleast_1d(np.array(_ev_list(val), dtype=float))
         return bool(np.any(arr != 0.0))
@@ -79,325 +78,497 @@ def _nonzero(val):
         return bool(val)
 
 
+def _n_log(r_lo, r_hi, slope, threshold, n_min=5, n_max=500):
+    step = threshold / max(abs(slope), 0.05)
+    return max(n_min, min(n_max, int(np.ceil(np.log(r_hi / r_lo) / step))))
+
+
+def _n_lin(lo, hi, step, n_min=3, n_max=300):
+    return max(n_min, min(n_max, int(np.ceil((hi - lo) / step))))
+
+
 # ---------------------------------------------------------------------------
 # Active structure detection
 # ---------------------------------------------------------------------------
 
+_PHI_STRUCTURE_KEYS = ('fourier_h', 'fourier_sig', 'spiral_h', 'spiral_sig',
+                       'vortex_h', 'vortex_sig', 'inner_edge')
+
+
 def _detect_active(ppar):
-    """Return dict of which model structures have non-zero amplitudes."""
     return {
-        'fourier_h':   _nonzero(ppar.get('h_fourier_aj', [0])) or
-                       _nonzero(ppar.get('h_fourier_bj', [0])),
-        'fourier_sig': _nonzero(ppar.get('sig_fourier_aj', [0])) or
-                       _nonzero(ppar.get('sig_fourier_bj', [0])),
-        'spiral_h':    abs(_ev(ppar.get('h_spiral_amp', 0))) > 0,
-        'spiral_sig':  abs(_ev(ppar.get('sig_spiral_amp', 0))) > 0,
-        'vortex_h':    _nonzero(ppar.get('h_vortex_amp', [0])),
-        'vortex_sig':  _nonzero(ppar.get('sig_vortex_amp', [0])),
-        'inner_rim':   _ev(ppar.get('prim_rout', 0.0)) >= 1.0,
-        'srim':        _ev(ppar.get('srim_rout', 0.0)) > 0.0,
-        'gaps':        any(abs(df) > 0 and abs(df) < 1.0
-                          for df in _ev_list(ppar.get('gap_drfact', [0.0]))),
-        'warp':        bool(_ev(ppar.get('enable_warp', False))),
-        'inner_edge':  bool(_ev(ppar.get('use_inner_edge_shadow', False))),
+        'fourier_h':      _nonzero(ppar.get('h_fourier_aj', [0])) or
+                          _nonzero(ppar.get('h_fourier_bj', [0])),
+        'fourier_sig':    _nonzero(ppar.get('sig_fourier_aj', [0])) or
+                          _nonzero(ppar.get('sig_fourier_bj', [0])),
+        'spiral_h':       abs(_ev(ppar.get('h_spiral_amp', 0))) > 0,
+        'spiral_sig':     abs(_ev(ppar.get('sig_spiral_amp', 0))) > 0,
+        'vortex_h':       _nonzero(ppar.get('h_vortex_amp', [0])),
+        'vortex_sig':     _nonzero(ppar.get('sig_vortex_amp', [0])),
+        'inner_rim':      _ev(ppar.get('prim_rout', 0.0)) >= 1.0,
+        'srim':           _ev(ppar.get('srim_rout', 0.0)) > 0.0,
+        'gaps':           any(abs(df) > 0 and abs(df) < 1.0
+                              for df in _ev_list(ppar.get('gap_drfact', [0.0]))),
+        'warp':           bool(_ev(ppar.get('enable_warp', False))),
+        'inner_edge':     bool(_ev(ppar.get('use_inner_edge_shadow', False))) and
+                          bool(_ev(ppar.get('inner_edge_azimuthal', False))),
+        'inner_edge_any': bool(_ev(ppar.get('use_inner_edge_shadow', False))),
+        'radial_damping': bool(_ev(ppar.get('use_radial_damping', False))) and
+                          _ev(ppar.get('azimuthal_r_max',   0.0)) > 0 and
+                          _ev(ppar.get('azimuthal_r_width', 0.0)) > 0,
     }
 
 
+def _has_phi_structure(active):
+    return any(active[k] for k in _PHI_STRUCTURE_KEYS)
+
+
 # ---------------------------------------------------------------------------
-# r-grid
+# Density evaluation -- replicates ppdisk_complete.py core physics
 # ---------------------------------------------------------------------------
 
-def _build_r_grid(ppar, active):
+def _eval_damping(ppar, rcyl, active):
+    """Radial damping factor DAMP(r) in [0, 1] applied to azimuthal modulations."""
+    if active.get('radial_damping', False):
+        r_max = _ev(ppar.get('azimuthal_r_max',   0.0))
+        r_w   = _ev(ppar.get('azimuthal_r_width', 0.0))
+        if r_max > 0 and r_w > 0:
+            return 0.5 * (1.0 - np.tanh((rcyl - r_max) / r_w))
+    return np.ones_like(rcyl) if hasattr(rcyl, '__len__') else 1.0
+
+
+def _eval_fourier_mod(ppar, phi, which):
+    """Sum of Fourier terms: sum_j [A_j cos(j phi) + B_j sin(j phi)]."""
+    prefix = 'h_fourier_' if which == 'h' else 'sig_fourier_'
+    ajs = np.array(_ev_list(ppar.get(prefix + 'aj', [0.0])))
+    bjs = np.array(_ev_list(ppar.get(prefix + 'bj', [0.0])))
+    result = np.zeros_like(phi)
+    for j, (a, b) in enumerate(zip(ajs, bjs), start=1):
+        if a != 0 or b != 0:
+            result += a * np.cos(j * phi) + b * np.sin(j * phi)
+    return result
+
+
+def _eval_hp(ppar, rcyl, phi, active):
     """
-    Build radial segment boundaries and cell counts.
+    Evaluate pressure scale height H(r_cyl, phi) including all active modulations.
+    Replicates the H computation in ppdisk_complete.getDustDensity.
+    """
+    hrdisk  = _ev(ppar['hrdisk'])
+    hrpivot = _ev(ppar['hrpivot'])
+    plh     = _ev(ppar['plh'])
 
-    Returns
-    -------
-    xbound : list of float  (cm)
-    nx     : list of int
-    segs   : list of dict   (for summary printing)
+    H = hrdisk * (rcyl / hrpivot) ** plh * rcyl
+
+    # Puffed inner rim (exact formula from ppdisk_complete.py)
+    if active.get('inner_rim', False):
+        rin      = _ev(ppar['rin'])
+        p_rout   = _ev(ppar['prim_rout'])
+        hpr_prim = _ev(ppar.get('hpr_prim_rout', 0.0))
+        if p_rout >= 1.0 and hpr_prim > 0.0:
+            hpr0 = hrdisk * (p_rout * rin / hrpivot) ** plh
+            if hpr0 > 1e-30:
+                dummy  = np.log10(max(hpr0 / hpr_prim, 1e-30)) / np.log10(max(p_rout, 1.001))
+                H_prim = hpr_prim * (rcyl / rin) ** dummy * rcyl
+                H      = np.maximum(H, H_prim)
+
+    # Inner edge shadow: raised wall at edge_radius
+    if active.get('inner_edge_any', False):
+        edge_r = _ev(ppar.get('inner_edge_radius', _ev(ppar['rin'])))
+        edge_w = _ev(ppar.get('inner_edge_width',  AU))
+        edge_h = _ev(ppar.get('inner_edge_height', 2.0))
+        r_prof = 0.5 * (1.0 - np.tanh((rcyl - edge_r) / max(edge_w / 4.0, 1e-30 * AU)))
+        if active.get('inner_edge', False):
+            phi_c  = _ev(ppar.get('inner_edge_phi',       0.0))
+            phi_w  = _ev(ppar.get('inner_edge_phi_width', PI / 4.0))
+            p_prof = np.exp(-0.5 * ((phi - phi_c) / max(phi_w, 1e-6)) ** 2)
+            H      = H * (1.0 + (edge_h - 1.0) * r_prof * p_prof)
+        else:
+            H = H * (1.0 + (edge_h - 1.0) * r_prof)
+
+    DAMP = _eval_damping(ppar, rcyl, active)
+
+    # Fourier modulation of H
+    if active.get('fourier_h', False):
+        fs   = _eval_fourier_mod(ppar, phi, 'h')
+        ms   = _ev(ppar.get('h_modulation_strength', 1.0))
+        asym = _ev(ppar.get('h_asymmetry_factor',    1.0))
+        fs_m = fs * ms
+        fmod = np.where(fs_m > 0, 1.0 + asym * fs_m, 1.0 + fs_m)
+        H    = H * (1.0 + DAMP * (fmod - 1.0))
+
+    # Spiral modulation of H
+    if active.get('spiral_h', False):
+        rin    = _ev(ppar['rin'])
+        amp    = _ev(ppar.get('h_spiral_amp',    0.0))
+        pitch  = _ev(ppar.get('spiral_pitch',    1.0))
+        n_arms = max(1, int(_ev(ppar.get('n_arms', 2))))
+        width  = _ev(ppar.get('spiral_width_phi', 0.5))
+        sharp  = _ev(ppar.get('spiral_sharpness', 1.0))
+        angle  = phi - pitch * np.log(np.maximum(rcyl, rin * 1e-6) / rin)
+        if n_arms > 1:
+            period = 2.0 * PI / n_arms
+            angle  = angle % period
+            angle  = np.where(angle > period / 2.0, period - angle, angle)
+        if sharp > 1:
+            pattern = 0.5 * (1.0 - np.tanh((np.abs(angle) - width / 2.0) / max(width / 4.0, 1e-9)))
+        else:
+            pattern = np.exp(-0.5 * (angle / max(width / 2.0, 1e-9)) ** 2)
+        H = H * (1.0 + DAMP * amp * pattern)
+
+    # Vortex modulation of H
+    if active.get('vortex_h', False):
+        amps  = _ev_list(ppar.get('h_vortex_amp',       [0.0]))
+        r0s   = _ev_list(ppar.get('h_vortex_r0',        [50 * AU]))
+        phi0s = _ev_list(ppar.get('h_vortex_phi0',      [0.0]))
+        wrs   = _ev_list(ppar.get('h_vortex_width_r',   [10 * AU]))
+        wphis = _ev_list(ppar.get('h_vortex_width_phi', [0.5]))
+        for amp, r0, phi0_v, wr, wphi in zip(amps, r0s, phi0s, wrs, wphis):
+            if amp == 0:
+                continue
+            phi0 = _ev(phi0_v) if isinstance(phi0_v, str) else float(phi0_v)
+            dr   = (rcyl - r0) / max(wr,   1e-30)
+            dphi = ((phi - phi0 + PI) % (2 * PI)) - PI
+            dphi = dphi / max(wphi, 1e-30)
+            H    = H * (1.0 + DAMP * amp * np.exp(-0.5 * dr ** 2) * np.exp(-0.5 * dphi ** 2))
+
+    # Warp (experimental)
+    if active.get('warp', False):
+        warp_amp   = _ev(ppar.get('warp_amplitude', 0.1))
+        warp_phase = _ev(ppar.get('warp_phase',     0.0))
+        warp_mode  = int(_ev(ppar.get('warp_mode',  1)))
+        H = H * (1.0 + warp_amp * np.cos(warp_mode * (phi - warp_phase)))
+
+    return H
+
+
+def _eval_sigma(ppar, rcyl, phi, active):
+    """
+    Evaluate surface density Sigma(r_cyl, phi) including all active modulations.
+    Returns relative units (normalised at rdisk=1 before mdisk scaling).
+    """
+    rin    = _ev(ppar['rin'])
+    rdisk  = _ev(ppar['rdisk'])
+    plsig1 = _ev(ppar.get('plsig1', -1.5))
+    stype  = int(_ev(ppar.get('sigma_type', 0)))
+
+    safe_r = np.maximum(rcyl, rin * 1e-6)
+    if stype == 1:
+        taper = np.exp(-(safe_r / rdisk) ** (2.0 - plsig1))
+        sig   = (safe_r / rdisk) ** (-plsig1) * taper
+    else:
+        sig   = (safe_r / rdisk) ** plsig1
+
+    # srim inner taper
+    if active.get('srim', False):
+        srim_r     = _ev(ppar['srim_rout']) * rin
+        srim_plsig = _ev(ppar.get('srim_plsig', -0.5))
+        if stype == 0:
+            sig_at_srim = (srim_r / rdisk) ** plsig1
+        else:
+            sig_at_srim = ((srim_r / rdisk) ** (-plsig1) *
+                           np.exp(-(srim_r / rdisk) ** (2.0 - plsig1)))
+        sig_rim = sig_at_srim * (safe_r / srim_r) ** srim_plsig
+        sig     = np.where(rcyl < srim_r, sig_rim, sig)
+
+    # Mask outside disk
+    sig = np.where((rcyl < rin) | (rcyl > rdisk), 0.0, sig)
+
+    DAMP = _eval_damping(ppar, rcyl, active)
+
+    # Fourier modulation of sigma
+    if active.get('fourier_sig', False):
+        fs   = _eval_fourier_mod(ppar, phi, 'sig')
+        ms   = _ev(ppar.get('sig_modulation_strength', 1.0))
+        asym = _ev(ppar.get('sig_asymmetry_factor',    1.0))
+        fs_m = fs * ms
+        fmod = np.where(fs_m > 0, 1.0 + asym * fs_m, 1.0 + fs_m)
+        sig  = sig * (1.0 + DAMP * (fmod - 1.0))
+
+    # Spiral modulation of sigma
+    if active.get('spiral_sig', False):
+        amp    = _ev(ppar.get('sig_spiral_amp',   0.0))
+        pitch  = _ev(ppar.get('spiral_pitch',     1.0))
+        n_arms = max(1, int(_ev(ppar.get('n_arms', 2))))
+        width  = _ev(ppar.get('spiral_width_phi', 0.5))
+        sharp  = _ev(ppar.get('spiral_sharpness', 1.0))
+        angle  = phi - pitch * np.log(np.maximum(rcyl, rin * 1e-6) / rin)
+        if n_arms > 1:
+            period = 2.0 * PI / n_arms
+            angle  = angle % period
+            angle  = np.where(angle > period / 2.0, period - angle, angle)
+        if sharp > 1:
+            pattern = 0.5 * (1.0 - np.tanh((np.abs(angle) - width / 2.0) / max(width / 4.0, 1e-9)))
+        else:
+            pattern = np.exp(-0.5 * (angle / max(width / 2.0, 1e-9)) ** 2)
+        sig = sig * (1.0 + DAMP * amp * pattern)
+
+    # Vortex modulation of sigma
+    if active.get('vortex_sig', False):
+        amps  = _ev_list(ppar.get('sig_vortex_amp',       [0.0]))
+        r0s   = _ev_list(ppar.get('sig_vortex_r0',        [50 * AU]))
+        phi0s = _ev_list(ppar.get('sig_vortex_phi0',      [0.0]))
+        wrs   = _ev_list(ppar.get('sig_vortex_width_r',   [10 * AU]))
+        wphis = _ev_list(ppar.get('sig_vortex_width_phi', [0.5]))
+        for amp, r0, phi0_v, wr, wphi in zip(amps, r0s, phi0s, wrs, wphis):
+            if amp == 0:
+                continue
+            phi0 = _ev(phi0_v) if isinstance(phi0_v, str) else float(phi0_v)
+            dr   = (rcyl - r0) / max(wr,   1e-30)
+            dphi = ((phi - phi0 + PI) % (2 * PI)) - PI
+            dphi = dphi / max(wphi, 1e-30)
+            sig  = sig * (1.0 + DAMP * amp * np.exp(-0.5 * dr ** 2) * np.exp(-0.5 * dphi ** 2))
+
+    # Gap depletion
+    if active.get('gaps', False):
+        grins  = _ev_list(ppar.get('gap_rin',    [0.0]))
+        grouts = _ev_list(ppar.get('gap_rout',   [0.0]))
+        gdfs   = _ev_list(ppar.get('gap_drfact', [1.0]))
+        for g_in, g_out, df in zip(grins, grouts, gdfs):
+            if abs(df) > 0 and abs(df) < 1.0 and g_out > g_in:
+                sig = np.where((rcyl > g_in) & (rcyl < g_out), sig * df, sig)
+
+    return sig
+
+
+def _eval_probe_density(ppar, active, nr=400, nth=160, nph=None):
+    """
+    Evaluate rho(r, theta, phi) on a probe grid.
+
+    Returns (r_c, th_c, ph_c, rho) where rho has shape (nr, nth, nph).
+    rho is proportional to the physical dust density (no absolute normalisation).
     """
     rin   = _ev(ppar['rin'])
     rdisk = _ev(ppar['rdisk'])
 
-    # ---- collect breakpoints -------------------------------------------------
-    bps = [0.1 * rin, rin]
+    # Probe extends beyond [rin, rdisk] to capture edge transitions cleanly
+    r_c  = np.geomspace(0.08 * rin, 1.15 * rdisk, nr)
+    th_c = np.linspace(0.01, PI - 0.01, nth)
 
-    rim_end = rin
+    if nph is None:
+        nph = 60 if _has_phi_structure(active) else 1
+    ph_c = (np.linspace(0.0, 2.0 * PI, nph, endpoint=False)
+            if nph > 1 else np.array([PI]))
 
-    if active['inner_rim']:
-        r_prim = _ev(ppar['prim_rout']) * rin
-        bps.append(r_prim)
-        rim_end = max(rim_end, r_prim)
+    R    = r_c[:, None, None]
+    TH   = th_c[None, :, None]
+    PH   = ph_c[None, None, :]
 
-    if active['srim']:
-        r_srim = _ev(ppar['srim_rout']) * rin
-        if r_srim > rim_end * 1.005:
-            bps.append(r_srim)
-            rim_end = max(rim_end, r_srim)
+    RCYL = R  * np.sin(TH)
+    Z    = R  * np.cos(TH)
 
-    # Ensure rim_end > rin by at least a small amount so we always have a
-    # separate inner segment even when no puffed rim is active.
-    if rim_end <= rin * 1.005:
-        rim_end = rin * 1.5
-        bps.append(rim_end)
+    H   = _eval_hp(ppar, RCYL, PH, active)
+    SIG = _eval_sigma(ppar, RCYL, PH, active)
 
-    # Gap edges
-    if active['gaps']:
-        grins  = _ev_list(ppar.get('gap_rin',    [0.0]))
-        grouts = _ev_list(ppar.get('gap_rout',   [0.0]))
-        gdfs   = _ev_list(ppar.get('gap_drfact', [0.0]))
-        for rg_in, rg_out, df in zip(grins, grouts, gdfs):
-            if abs(df) > 0 and abs(df) < 1.0 and rg_out > rim_end:
-                rg_in  = max(rim_end * 1.01, rg_in)
-                rg_out = min(rdisk * 0.995, rg_out)
-                if rg_in < rg_out:
-                    bps.extend([rg_in, rg_out])
+    H   = np.maximum(H, 1e-30 * rin)
+    SIG = np.maximum(SIG, 0.0)
 
-    # Vortex zones
-    for amp_k, r0_k, wr_k in [
-        ('h_vortex_amp',   'h_vortex_r0',   'h_vortex_width_r'),
-        ('sig_vortex_amp', 'sig_vortex_r0', 'sig_vortex_width_r'),
-    ]:
-        amps = np.atleast_1d(_ev_list(ppar.get(amp_k, [0.0])))
-        r0s  = np.atleast_1d(_ev_list(ppar.get(r0_k,  [50*AU])))
-        wrs  = np.atleast_1d(_ev_list(ppar.get(wr_k,  [10*AU])))
-        for amp, r0, wr in zip(amps, r0s, wrs):
-            if amp > 0 and rin < r0 < rdisk:
-                lo = max(rim_end * 1.001, r0 - 2.0*wr)
-                hi = min(rdisk  * 0.999, r0 + 2.0*wr)
-                if lo < hi:
-                    bps.extend([lo, hi])
+    z_h = Z / H
+    rho = (SIG / H) * np.exp(-0.5 * z_h ** 2)
 
-    bps.append(rdisk)
-    bps.append(max(rdisk * 1.1, rdisk + 20*AU))
+    return r_c, th_c, ph_c, rho
 
-    # ---- deduplicate --------------------------------------------------------
-    bps = sorted(set(bps))
-    clean = [bps[0]]
-    for b in bps[1:]:
-        if b > clean[-1] * 1.005:
-            clean.append(b)
-    bps = clean
 
-    # ---- assign cell counts per segment -------------------------------------
-    rim_log   = np.log(rim_end / rin)
-    main_log  = np.log(rdisk  / rim_end)
+# ---------------------------------------------------------------------------
+# Smoothing and marching algorithms
+# ---------------------------------------------------------------------------
 
-    xbound = []
-    nx     = []
-    segs   = []
+def _smooth(arr, n=7):
+    """N-point box smoother (scipy if available, fallback to pure numpy)."""
+    arr = np.asarray(arr, dtype=float)
+    try:
+        from scipy.ndimage import uniform_filter1d
+        return uniform_filter1d(arr, size=n)
+    except ImportError:
+        k   = n // 2
+        out = arr.copy()
+        for i in range(len(arr)):
+            lo     = max(0, i - k)
+            hi     = min(len(arr), i + k + 1)
+            out[i] = arr[lo:hi].mean()
+        return out
 
-    for i in range(len(bps) - 1):
-        r_lo, r_hi = bps[i], bps[i+1]
 
-        if r_hi <= rin:
-            # pre-disk buffer
-            n     = 20
-            label = 'pre-disk buffer'
+def _march_log(x_probe, g, threshold, x_min, x_max, min_g=0.02):
+    """
+    Build log-spaced interfaces by marching from x_min to x_max.
+    At each position, step size dr/r = threshold / g(r).
+    """
+    interfaces = [float(x_min)]
+    x = float(x_min)
+    x_max = float(x_max)
+    while x < x_max * (1.0 - 1e-9):
+        gi     = max(float(np.interp(x, x_probe, g)), min_g)
+        x_next = x * (1.0 + threshold / gi)
+        if x_next >= x_max:
+            break
+        interfaces.append(x_next)
+        x = x_next
+    interfaces.append(x_max)
+    return np.array(interfaces)
 
-        elif r_lo < rdisk and r_hi <= rim_end * 1.001:
-            # inner rim / srim region  — 50 cells total, log-proportional
-            seg_log = np.log(r_hi / max(r_lo, rin))
-            frac    = seg_log / rim_log if rim_log > 0 else 1.0
-            n       = max(8, round(50 * frac))
-            if active['inner_rim'] and active['srim']:
-                label = 'inner rim / srim'
-            elif active['inner_rim']:
-                label = 'inner rim'
-            elif active['srim']:
-                label = 'srim taper'
-            else:
-                label = 'inner disk'
 
-        elif r_lo >= rdisk:
-            # outer buffer
-            n     = 10
-            label = 'outer buffer'
+def _march_lin(x_probe, g, threshold, x_min, x_max, min_g=None):
+    """
+    Build linearly-spaced interfaces by marching from x_min to x_max.
+    At each position, step size dx = threshold / g(x).
+    """
+    if min_g is None:
+        min_g = threshold / max(float(x_max) - float(x_min), 1e-30) * 3.0
+    interfaces = [float(x_min)]
+    x = float(x_min)
+    x_max = float(x_max)
+    while x < x_max * (1.0 - 1e-9):
+        gi     = max(float(np.interp(x, x_probe, g)), min_g)
+        x_next = x + threshold / gi
+        if x_next >= x_max:
+            break
+        interfaces.append(x_next)
+        x = x_next
+    interfaces.append(x_max)
+    return np.array(interfaces)
 
+
+# ---------------------------------------------------------------------------
+# Interface builders from probe density
+# ---------------------------------------------------------------------------
+
+def _build_r_interfaces(r_c, th_c, rho, threshold):
+    """
+    Build r interfaces from |d ln rho / d ln r| measured at the midplane.
+    Using the midplane slice avoids picking up near-zero polar densities that
+    would create false huge gradients at rin/rdisk where sigma transitions.
+    """
+    i_mid = np.argmin(np.abs(th_c - PI / 2.0))
+    dn    = max(1, len(th_c) // 20)           # ~5% of probe cells around midplane
+    i_lo  = max(0, i_mid - dn)
+    i_hi  = min(len(th_c), i_mid + dn + 1)
+    rho_mid   = rho[:, i_lo:i_hi, :].max(axis=(1, 2))   # (nr,)
+    rho_floor = max(float(rho_mid.max()) * 1e-4, 1e-100)
+    rho_mid   = np.maximum(rho_mid, rho_floor)
+    g_r = np.abs(np.gradient(np.log(rho_mid), np.log(r_c)))
+    g_r = np.maximum(_smooth(g_r, n=7), 0.02)
+    return _march_log(r_c, g_r, threshold, r_c[0], r_c[-1], min_g=0.02)
+
+
+def _build_th_interfaces(r_c, th_c, rho, threshold):
+    """
+    Build theta interfaces from the maximum |d ln rho / d theta| over all (r, phi).
+    The grid is symmetric around pi/2 (exact midplane boundary).
+    Uses a per-r cap of 1% of the local midplane density so we only resolve to
+    ~3 scale heights at each radius -- this prevents raised-H features (inner
+    edge shadow, puffed rim) from extending the resolved theta region to many
+    scale heights above the midplane.
+    """
+    # Cap at 1% of local (r, phi) midplane density so we resolve to ~3 scale
+    # heights everywhere.  This prevents raised-H features (shadow, puffed rim)
+    # from extending the resolved region deep into the polar atmosphere.
+    # Floor: always cap at least to 1e-4 of the global max so the disk-edge
+    # theta transition (rcyl crossing rin/rdisk as theta changes) is never
+    # resolved with a floor of 1e-100.
+    i_mid = np.argmin(np.abs(th_c - PI / 2.0))
+    rho_mid_rph = rho[:, i_mid, :]                           # (nr, nph) midplane slice
+    rho_cap_rph = np.maximum(rho_mid_rph * 1e-2,
+                             float(rho.max()) * 1e-4)        # (nr, nph)
+    rho_cap_rph = rho_cap_rph[:, None, :]                    # (nr, 1, nph) broadcast
+
+    log_rho = np.log(np.maximum(rho, rho_cap_rph))
+    g_th_3d = np.abs(np.gradient(log_rho, th_c, axis=1))
+
+    # Worst-case requirement over all r and phi
+    g_th = g_th_3d.max(axis=(0, 2))
+    # Floor: at most 0.25 rad/cell (prevents single-cell steps wider than ~14 deg)
+    g_th = np.maximum(_smooth(g_th, n=7), threshold / 0.25)
+
+    # Build upper hemisphere only (theta from th_c[0] toward pi/2)
+    mask   = th_c <= PI / 2.0 + 1e-6
+    th_up  = th_c[mask]
+    g_up   = g_th[:len(th_up)]
+
+    th_if_up = _march_lin(th_up, g_up, threshold,
+                          x_min=th_c[0], x_max=PI / 2.0,
+                          min_g=threshold / 0.25)
+    th_if_up[-1] = PI / 2.0   # exact midplane -- required by radmc3dPy
+
+    # Mirror for lower hemisphere (skip duplicate pi/2)
+    th_if_lo = PI - th_if_up[::-1][1:]
+    return np.concatenate([th_if_up, th_if_lo])
+
+
+def _build_ph_interfaces(r_c, th_c, ph_c, rho, threshold, active):
+    """
+    Build phi interfaces from |d ln rho / d phi| measured at the midplane.
+    Using the midplane region avoids large-z disk atmosphere gradients (e.g.
+    from the inner edge shadow raising H in the shadow direction, which creates
+    a huge phi contrast at several scale heights even though physically
+    irrelevant for the grid).  Returns [0, 2pi] for axisymmetric models.
+    """
+    if not _has_phi_structure(active) or len(ph_c) <= 1:
+        return np.array([0.0, 2.0 * PI])
+
+    i_mid = np.argmin(np.abs(th_c - PI / 2.0))
+    dn    = max(1, len(th_c) // 10)           # ~10% of probe cells around midplane
+    i_lo  = max(0, i_mid - dn)
+    i_hi  = min(len(th_c), i_mid + dn + 1)
+    rho_mid = rho[:, i_lo:i_hi, :]            # (nr, n_mid, nph)
+
+    rho_cap = max(float(rho_mid.max()) * 1e-2, 1e-100)
+    log_rho = np.log(np.maximum(rho_mid, rho_cap))
+    g_ph_3d = np.abs(np.gradient(log_rho, ph_c, axis=2))
+
+    g_ph = g_ph_3d.max(axis=(0, 1))
+    g_ph = np.maximum(_smooth(g_ph, n=3), threshold / (PI / 6.0))
+
+    ph_if      = _march_lin(ph_c, g_ph, threshold,
+                            x_min=0.0, x_max=2.0 * PI,
+                            min_g=threshold / (PI / 6.0))
+    ph_if[-1]  = 2.0 * PI
+    return ph_if
+
+
+# ---------------------------------------------------------------------------
+# Convert interface arrays to (bounds, counts) format for radmc3dPy
+# ---------------------------------------------------------------------------
+
+def _to_segments(interfaces):
+    """
+    Convert an interface array [x0, x1, ..., xN] to (bounds, counts) where
+    bounds = [x0,...,xN] and counts = [1,...,1, 2] (N-1 elements).
+
+    This produces N-1 cells with boundaries at the provided positions.
+    The last segment has count=2 so _interfaces() includes both endpoints.
+    """
+    N      = len(interfaces)
+    bounds = [float(v) for v in interfaces]
+    if N == 2:
+        return bounds, [1]
+    counts = [1] * (N - 2) + [2]
+    return bounds, counts
+
+
+def _to_segments_th(th_if):
+    """
+    Like _to_segments but replaces the float closest to pi/2 with the
+    string 'pi/2.' -- required by radmc3dPy's reggrid.py boundary check.
+    """
+    bounds_raw, counts = _to_segments(th_if)
+    bounds = []
+    for v in bounds_raw:
+        if abs(v - PI / 2.0) < 1e-9:
+            bounds.append("pi/2.")
         else:
-            # main disk
-            seg_log = np.log(r_hi / r_lo)
-            frac    = seg_log / main_log if main_log > 0 else 1.0
-
-            # Is this a vortex zone?
-            in_vortex = False
-            for amp_k, r0_k, wr_k in [
-                ('h_vortex_amp',   'h_vortex_r0',   'h_vortex_width_r'),
-                ('sig_vortex_amp', 'sig_vortex_r0', 'sig_vortex_width_r'),
-            ]:
-                amps = np.atleast_1d(_ev_list(ppar.get(amp_k, [0.0])))
-                r0s  = np.atleast_1d(_ev_list(ppar.get(r0_k,  [50*AU])))
-                wrs  = np.atleast_1d(_ev_list(ppar.get(wr_k,  [10*AU])))
-                for amp, r0, wr in zip(amps, r0s, wrs):
-                    if amp > 0 and r_lo < r0 + 2*wr and r_hi > r0 - 2*wr:
-                        in_vortex = True
-
-            if in_vortex:
-                n     = max(12, round(100 * frac * 3.0))
-                label = 'vortex zone'
-            else:
-                n     = max(5, round(100 * frac))
-                label = 'main disk'
-
-        xbound.append(r_lo)
-        nx.append(n)
-        segs.append({'r_lo': r_lo/AU, 'r_hi': r_hi/AU, 'n': n, 'label': label})
-
-    xbound.append(bps[-1])
-    return xbound, nx, segs
+            bounds.append(float(v))
+    return bounds, counts
 
 
 # ---------------------------------------------------------------------------
-# theta-grid
-# ---------------------------------------------------------------------------
-
-def _build_theta_grid(ppar):
-    """
-    Build a colatitude grid concentrated toward the midplane (theta=pi/2).
-
-    Uses 6 segments total (3 per hemisphere), with the innermost segment
-    determined by the expected disk scale-height extent.
-
-    Returns
-    -------
-    ybound : list of float (radians)
-    ny     : list of int
-    info   : dict  (for summary)
-    """
-    rin      = _ev(ppar['rin'])
-    rdisk    = _ev(ppar['rdisk'])
-    hrdisk   = _ev(ppar['hrdisk'])
-    hrpivot  = _ev(ppar['hrpivot'])
-    plh      = _ev(ppar['plh'])
-
-    # Scale height at outer disk
-    H_outer  = hrdisk * (rdisk / hrpivot)**plh * rdisk
-
-    # Angular half-extent of the disk (3 scale heights, with 50% margin)
-    sin_dt   = min(0.98, 3.0 * H_outer / rdisk)
-    delta_th = np.arcsin(sin_dt) * 1.5          # with margin
-    delta_th = min(delta_th, PI/4)
-
-    # Puffed inner rim adds extra vertical extent
-    prim_rout    = _ev(ppar.get('prim_rout',    0.0))
-    hpr_prim     = _ev(ppar.get('hpr_prim_rout', 0.0))
-    if prim_rout >= 1.0 and hpr_prim > 0.0:
-        delta_th = max(delta_th, 3.0 * hpr_prim * 1.5)
-
-    # Segment breakpoints (upper hemisphere, symmetric lower)
-    th_mid        = PI / 2.0
-    th_disk_edge  = th_mid - delta_th          # boundary between atm / disk
-    th_polar      = 0.30                        # sparse polar cap boundary
-
-    # Guard: disk_edge must sit between polar and midplane
-    th_disk_edge  = max(th_polar + 0.05, min(th_disk_edge, th_mid - 0.05))
-
-    # Cell counts
-    n_polar = 8    # [0, th_polar]
-    n_atm   = 15   # [th_polar, th_disk_edge]
-    n_mid   = 40   # [th_disk_edge, pi/2]  — densest
-
-    # Build ybound / ny for full sphere
-    ybound = [
-        0.0,
-        th_polar,
-        th_disk_edge,
-        th_mid,
-        PI - th_disk_edge,
-        PI - th_polar,
-        PI,
-    ]
-    ny = [n_polar, n_atm, n_mid, n_mid, n_atm, n_polar]
-
-    # Cell size near midplane (rad/cell)
-    cell_th_mid = (th_mid - th_disk_edge) / n_mid
-
-    # Scale height in theta at outer disk
-    sh_th = H_outer / rdisk    # rad
-
-    info = {
-        'n_total'      : sum(ny),
-        'th_disk_edge' : th_disk_edge,
-        'cell_th_mid'  : cell_th_mid,
-        'sh_th'        : sh_th,
-        'cells_per_sh' : sh_th / cell_th_mid if cell_th_mid > 0 else 0,
-    }
-    return ybound, ny, info
-
-
-# ---------------------------------------------------------------------------
-# phi-grid
-# ---------------------------------------------------------------------------
-
-def _compute_n_phi(ppar, active):
-    """Return the optimal number of phi cells based on active structures."""
-    n_phi = 120   # baseline minimum (enough for smooth images)
-
-    # Fourier modes: need ≥ 6 cells per half-cycle at highest active mode
-    if active['fourier_h'] or active['fourier_sig']:
-        aj = _ev_list(ppar.get('h_fourier_aj',   [0.0]))
-        bj = _ev_list(ppar.get('h_fourier_bj',   [0.0]))
-        as_ = _ev_list(ppar.get('sig_fourier_aj', [0.0]))
-        bs  = _ev_list(ppar.get('sig_fourier_bj', [0.0]))
-        all_c = aj + bj + as_ + bs
-        # highest non-zero index
-        j_max = 0
-        for idx, c in enumerate(all_c):
-            if abs(c) > 0:
-                j_max = max(j_max, idx % max(len(aj), 1))
-        n_phi = max(n_phi, 8 * max(1, j_max) * 2)
-
-    # Spirals: need ~8 cells per spiral arm width over 2*pi
-    if active['spiral_h'] or active['spiral_sig']:
-        n_arms = max(1, int(_ev(ppar.get('n_arms', 1))))
-        width  = _ev(ppar.get('spiral_width_phi', 0.5))
-        if width > 0:
-            n_phi = max(n_phi, int(np.ceil(2*PI / width * 8)) * n_arms)
-
-    # Vortices: need ~8 cells per (narrowest active) vortex width in phi
-    if active['vortex_h'] or active['vortex_sig']:
-        min_w = float('inf')
-        for amp_k, wp_k in [('h_vortex_amp',   'h_vortex_width_phi'),
-                             ('sig_vortex_amp', 'sig_vortex_width_phi')]:
-            amps  = _ev_list(ppar.get(amp_k, [0.0]))
-            wphis = _ev_list(ppar.get(wp_k,  [0.5]))
-            for amp, wp in zip(amps, wphis):
-                if amp > 0 and wp > 0:
-                    min_w = min(min_w, wp)
-        if min_w < float('inf'):
-            n_phi = max(n_phi, int(np.ceil(2*PI / min_w * 8)))
-
-    # Round up to next multiple of 12 (divisible by both 3 and 4)
-    n_phi = int(np.ceil(n_phi / 12) * 12)
-
-    # Safety cap
-    if n_phi > 1200:
-        n_phi = 1200
-
-    return n_phi
-
-
-def _build_phi_grid(n_phi):
-    """Uniform phi grid over [0, 2pi]. Returns (zbound, nz)."""
-    half = n_phi // 2
-    return [0.0, PI, 2.0*PI], [half, n_phi - half]
-
-
-# ---------------------------------------------------------------------------
-# Cell interface arrays (for write_amr_grid and validation)
+# Cell interface arrays (used by write_amr_grid, summary, and diagnostic plot)
 # ---------------------------------------------------------------------------
 
 def _interfaces(bounds, counts, log_spaced):
-    """
-    Compute cell wall positions from segment bounds + counts.
-
-    For all segments except the last: includes left boundary, excludes right.
-    For the last segment: includes both boundaries.
-    Requires counts[-1] >= 2.
-    """
-    pts = []
+    pts    = []
     n_segs = len(counts)
+    bounds = [float(_ev(b)) if isinstance(b, str) else float(b) for b in bounds]
     for i, (lo, hi, n) in enumerate(zip(bounds[:-1], bounds[1:], counts)):
         n = max(2, n) if i == n_segs - 1 else max(1, n)
         if i < n_segs - 1:
@@ -432,157 +603,155 @@ def _nph_from_grid(zbound, nz):
 # ---------------------------------------------------------------------------
 
 def _estimate_ram_gib(ncell, n_spec=1):
-    """Lower-bound RAM estimate (GiB) matching single_run.estimate_grid_memory."""
-    B = 8  # float64 bytes
-    python_setup   = 5  * ncell * B
-    dust_arrays    = 2  * n_spec * ncell * B
-    radmc_core     = (2 * n_spec + 4) * ncell * B
-    return (python_setup + dust_arrays + radmc_core) / 1024**3
+    B = 8
+    return ((5 + 2 * n_spec + 2 * n_spec + 4) * ncell * B) / 1024 ** 3
 
 
 # ---------------------------------------------------------------------------
-# Validation and summary printing
+# Summary
 # ---------------------------------------------------------------------------
 
 def _print_summary(xbound, nx, ybound, ny, zbound, nz,
-                   r_segs, th_info, active, orig_ppar):
-    """Print a formatted grid summary to stdout."""
+                   active, orig_ppar, threshold,
+                   nphot_scat_rec=None, nphot_scat_cfg=None):
     nr,  xi = _nr_from_grid(xbound, nx)
     nth, yi = _nth_from_grid(ybound, ny)
     nph, zi = _nph_from_grid(zbound, nz)
+    total   = nr * nth * nph
 
-    total = nr * nth * nph
-
-    # Original grid size for comparison
     orig_nr  = sum(orig_ppar['nx']) if isinstance(orig_ppar.get('nx'), list) else int(orig_ppar.get('nx', 0))
     orig_nth = sum(orig_ppar['ny']) if isinstance(orig_ppar.get('ny'), list) else int(orig_ppar.get('ny', 0))
     orig_nph = sum(orig_ppar['nz']) if isinstance(orig_ppar.get('nz'), list) else int(orig_ppar.get('nz', 0))
     orig_total = orig_nr * orig_nth * orig_nph
 
-    n_spec = 1
+    ram_new  = _estimate_ram_gib(total)
+    ram_orig = _estimate_ram_gib(orig_total) if orig_total else 0.0
 
-    ram_new  = _estimate_ram_gib(total, n_spec)
-    ram_orig = _estimate_ram_gib(orig_total, n_spec) if orig_total else 0.0
+    W = 72
+    print('\n' + '-' * W)
+    print('  Smart Grid Builder -- Summary  (density-gradient adaptive)')
+    print('-' * W)
+    print(f'  Threshold          : {threshold:.3g}  '
+          f'(max |delta ln rho| per cell = {threshold*100:.1f}%)')
 
-    W = 68
-    print('\n' + '─' * W)
-    print('  Smart Grid Builder — Summary')
-    print('─' * W)
-
-    # Active structures
     on  = [k for k, v in active.items() if v]
     off = [k for k, v in active.items() if not v]
     print(f'  Active structures  : {", ".join(on) if on else "none"}')
     print(f'  Inactive (skipped) : {", ".join(off) if off else "none"}')
     print()
 
-    # r-grid
-    print(f'  r-grid  {nr} cells ({len(nx)} segments)')
-    for s in r_segs:
-        lo_str = f'{s["r_lo"]:>8.2f}'
-        hi_str = f'{s["r_hi"]:<8.2f}'
-        print(f'    [{lo_str}, {hi_str}] au  {s["n"]:>4d} cells  ({s["label"]})')
-    # dr/r range in main disk
-    if len(xi) > 1:
-        dr_r = np.diff(xi) / xi[:-1]
-        print(f'    dr/r range: {dr_r.min()*100:.1f}% – {dr_r.max()*100:.1f}%')
+    rin   = _ev(orig_ppar['rin'])
+    rdisk = _ev(orig_ppar['rdisk'])
+    dr_r  = np.diff(xi) / xi[:-1]
+    print(f'  r-grid  {nr} cells')
+    print(f'    dr/r range: {dr_r.min()*100:.2f}% - {dr_r.max()*100:.1f}%  '
+          f'(rin={rin/AU:.2f} au, rdisk={rdisk/AU:.0f} au)')
     print()
 
-    # theta-grid
-    print(f'  θ-grid  {nth} cells ({len(ny)} segments, midplane-concentrated)')
-    th_pairs = list(zip(ybound[:-1], ybound[1:], ny))
-    for lo, hi, n in th_pairs:
-        print(f'    [{lo:5.3f}, {hi:5.3f}] rad  {n:>4d} cells')
-    cps = th_info['cells_per_sh']
-    print(f'    Cell size near midplane: {th_info["cell_th_mid"]:.4f} rad  '
-          f'({cps:.1f} cells / scale-height at outer disk)')
+    ybound_f = [float(_ev(b)) if isinstance(b, str) else float(b) for b in ybound]
+    dth = np.diff(ybound_f)
+    th_mid_cell = dth[len(dth) // 2]
+    print(f'  th-grid {nth} cells')
+    print(f'    dtheta range: {np.degrees(dth.min()):.3f} - {np.degrees(dth.max()):.2f} deg  '
+          f'(near midplane: {np.degrees(th_mid_cell):.3f} deg)')
     print()
 
-    # phi-grid
-    print(f'  φ-grid  {nph} cells (uniform)')
-    reasons = []
-    if not any(active[k] for k in ('fourier_h', 'fourier_sig',
-                                    'spiral_h', 'spiral_sig',
-                                    'vortex_h', 'vortex_sig')):
-        reasons.append('no active azimuthal structures → minimum 120')
-    if active['spiral_h'] or active['spiral_sig']:
-        reasons.append('set by spiral width')
-    if active['vortex_h'] or active['vortex_sig']:
-        reasons.append('set by vortex width')
-    if reasons:
-        print(f'    ({"; ".join(reasons)})')
+    if nph == 1:
+        print(f'  phi-grid 1 cell  (axisymmetric -- 2D mode, no spoke artifacts)')
+    else:
+        dph = np.diff(zi)
+        print(f'  phi-grid {nph} cells')
+        print(f'    dphi range: {np.degrees(dph.min()):.2f} - {np.degrees(dph.max()):.2f} deg')
     print()
 
-    # Totals
     print(f'  {"TOTAL CELLS":20s}  {total:>12,d}')
     if orig_total:
         reduction = orig_total / total if total else 0
-        print(f'  {"Config grid":20s}  {orig_total:>12,d}  ({orig_nr} × {orig_nth} × {orig_nph})')
-        print(f'  {"Reduction":20s}  {reduction:>11.0f}×')
+        print(f'  {"Config grid":20s}  {orig_total:>12,d}  ({orig_nr} x {orig_nth} x {orig_nph})')
+        print(f'  {"Reduction":20s}  {reduction:>11.1f}x')
     print()
     print(f'  RAM lower bound (new)    : {ram_new:.2f} GiB')
     if orig_total:
         print(f'  RAM lower bound (config) : {ram_orig:.2f} GiB')
 
-    # Warnings
-    warnings = []
-    if total > 50_000_000:
-        warnings.append(f'Grid exceeds 50 M cells — consider reducing active structure sharpness')
-    if active['vortex_h'] or active['vortex_sig']:
-        wphis = (_ev_list(orig_ppar.get('h_vortex_width_phi',  [0.5])) +
-                 _ev_list(orig_ppar.get('sig_vortex_width_phi', [0.5])))
-        if any(wp < 0.05 for wp in wphis):
-            warnings.append('vortex_width_phi < 0.05 rad → Nφ very large; '
-                            'consider increasing vortex_width_phi')
-
-    if warnings:
+    if nphot_scat_rec is not None:
         print()
-        for w in warnings:
-            print(f'  ⚠  {w}')
+        cfg_str = f'{int(nphot_scat_cfg):.2e}' if nphot_scat_cfg else '?'
+        status  = 'OK' if (nphot_scat_cfg and nphot_scat_cfg >= nphot_scat_rec) else 'TOO LOW'
+        print(f'  nphot_scat (config)      : {cfg_str}  [{status}]')
+        print(f'  nphot_scat (recommended) : {nphot_scat_rec:.2e}  (10 photons/cell)')
+        if nphot_scat_cfg and nphot_scat_cfg < nphot_scat_rec:
+            print(f'  -> pipeline will use {nphot_scat_rec:.2e} to avoid MC noise')
 
-    print('─' * W + '\n')
+    if total > 50_000_000:
+        print(f'\n  WARNING: Grid exceeds 50 M cells -- consider raising threshold')
+
+    print('-' * W + '\n')
 
 
 # ---------------------------------------------------------------------------
 # Main public function
 # ---------------------------------------------------------------------------
 
-def build_smart_grid(ppar, verbose=True):
+def build_smart_grid(ppar, threshold=0.1, verbose=True):
     """
     Compute an optimal RADMC-3D spherical grid from a pipeline params dict.
 
+    Evaluates the dust density model on a coarse probe grid, measures the
+    actual |delta ln rho| gradient in every direction, and places cell
+    interfaces so each cell satisfies |delta ln rho| <= threshold.
+
     Parameters
     ----------
-    ppar    : dict  — same format as the Pipeline config params dict.
-              String values like '0.5*au' are evaluated automatically.
-    verbose : bool  — print the summary table (default True).
+    ppar      : dict   -- pipeline config params (string values like '0.5*au' are ok).
+    threshold : float  -- max |delta ln rho| per cell (default 0.1 = 10%).
+    verbose   : bool   -- print the summary table.
 
     Returns
     -------
-    dict with keys:
-        xbound, nx   — radial segment boundaries (cm) and cell counts
-        ybound, ny   — colatitude boundaries (rad) and cell counts
-        zbound, nz   — azimuthal boundaries (rad) and cell counts
+    dict with keys xbound, nx, ybound, ny, zbound, nz, nphot_scat_rec.
     """
     active = _detect_active(ppar)
 
-    xbound, nx, r_segs = _build_r_grid(ppar, active)
-    ybound, ny, th_info = _build_theta_grid(ppar)
+    # Evaluate the density model on a probe grid
+    r_c, th_c, ph_c, rho = _eval_probe_density(ppar, active)
 
-    n_phi          = _compute_n_phi(ppar, active)
-    zbound, nz     = _build_phi_grid(n_phi)
+    # Build interface arrays from measured density gradients
+    r_if  = _build_r_interfaces(r_c, th_c, rho, threshold)
+    th_if = _build_th_interfaces(r_c, th_c, rho, threshold)
+    ph_if = _build_ph_interfaces(r_c, th_c, ph_c, rho, threshold, active)
+
+    # Convert to (bounds, counts) format for radmc3dPy / problemSetupDust
+    xbound, nx = _to_segments(r_if)
+    ybound, ny = _to_segments_th(th_if)
+
+    if len(ph_if) == 2:                    # axisymmetric: radmc3dPy needs nz=[0] to
+        zbound, nz = [0.0, float(2.0 * PI)], [0]  # write act_dim=0 (phi off) in amr_grid.inp
+    else:
+        zbound, nz = _to_segments(ph_if)
+
+    # Recommended nphot_scat: ~10 MC photon hits per cell
+    nr  = len(r_if) - 1
+    nth = len(th_if) - 1
+    nph = len(ph_if) - 1
+    total_cells    = nr * nth * nph
+    exp            = int(np.ceil(np.log10(max(10 * total_cells, 1))))
+    nphot_scat_rec = int(10 ** exp)
 
     if verbose:
         _print_summary(xbound, nx, ybound, ny, zbound, nz,
-                       r_segs, th_info, active, ppar)
+                       active, ppar, threshold,
+                       nphot_scat_rec=nphot_scat_rec,
+                       nphot_scat_cfg=_ev(ppar.get('nphot_scat', 0)))
 
     return {
-        'xbound': xbound,
-        'nx':     nx,
-        'ybound': ybound,
-        'ny':     ny,
-        'zbound': zbound,
-        'nz':     nz,
+        'xbound':         xbound,
+        'nx':             nx,
+        'ybound':         ybound,
+        'ny':             ny,
+        'zbound':         zbound,
+        'nz':             nz,
+        'nphot_scat_rec': nphot_scat_rec,
     }
 
 
@@ -591,18 +760,24 @@ def build_smart_grid(ppar, verbose=True):
 # ---------------------------------------------------------------------------
 
 def write_amr_grid(xbound, nx, ybound, ny, zbound, nz, fname='amr_grid.inp'):
-    """Write a RADMC-3D compatible amr_grid.inp for a regular spherical grid."""
     nr,  xi = _nr_from_grid(xbound, nx)
     nth, yi = _nth_from_grid(ybound, ny)
-    nph, zi = _nph_from_grid(zbound, nz)
+    # nz=[0] means axisymmetric (phi inactive) -- act_dim[2]=0, no phi interfaces
+    axisym = (isinstance(nz, list) and len(nz) == 1 and nz[0] == 0)
+    if axisym:
+        nph = 1
+        zi  = np.array([0.0, 2.0 * PI])
+    else:
+        nph, zi = _nph_from_grid(zbound, nz)
+    act_phi = 0 if axisym else 1
 
-    print(f'Writing {fname}  ({nr} × {nth} × {nph} = {nr*nth*nph:,} cells)')
+    print(f'Writing {fname}  ({nr} x {nth} x {nph} = {nr*nth*nph:,} cells, phi_active={act_phi})')
     with open(fname, 'w') as f:
-        f.write('1\n')      # iformat
-        f.write('0\n')      # grid_style (0 = regular)
-        f.write('100\n')    # coordsystem (100 = spherical)
-        f.write('0\n')      # gridinfo
-        f.write('1 1 1\n')  # active dimensions
+        f.write('1\n')
+        f.write('0\n')
+        f.write('100\n')
+        f.write('0\n')
+        f.write(f'1 1 {act_phi}\n')
         f.write(f'{nr} {nth} {nph}\n')
         for v in xi:
             f.write('%.9e\n' % v)
@@ -612,14 +787,17 @@ def write_amr_grid(xbound, nx, ybound, ny, zbound, nz, fname='amr_grid.inp'):
             f.write('%.9e\n' % v)
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic plot
+# ---------------------------------------------------------------------------
+
 def _make_diagnostic_plot(xbound, nx, ybound, ny, ppar, active, outfile=None):
-    """Save (or show) a two-panel figure: dr/r vs r, and dtheta vs theta."""
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
     except ImportError:
-        print('matplotlib not available — skipping diagnostic plot')
+        print('matplotlib not available -- skipping diagnostic plot')
         return
 
     nr, xi = _nr_from_grid(xbound, nx)
@@ -629,61 +807,41 @@ def _make_diagnostic_plot(xbound, nx, ybound, ny, ppar, active, outfile=None):
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
-    # --- panel 1: dr/r vs r --------------------------------------------------
     ax = axes[0]
     r_c  = 0.5 * (xi[:-1] + xi[1:])
     dr_r = np.diff(xi) / r_c
     ax.semilogy(r_c / AU, dr_r * 100, color='steelblue', linewidth=1.2)
     ax.axvline(rin   / AU, color='orange', lw=1.0, ls='--', label='rin')
     ax.axvline(rdisk / AU, color='red',    lw=1.0, ls='--', label='rdisk')
-
-    # Structure markers
-    if active['inner_rim']:
+    if active.get('inner_rim'):
         ax.axvline(_ev(ppar['prim_rout']) * rin / AU,
                    color='purple', lw=0.8, ls=':', label='prim_rout')
-    if active['srim']:
+    if active.get('srim'):
         ax.axvline(_ev(ppar['srim_rout']) * rin / AU,
                    color='teal', lw=0.8, ls=':', label='srim_rout')
-    for amp_k, r0_k in [('h_vortex_amp',   'h_vortex_r0'),
-                         ('sig_vortex_amp', 'sig_vortex_r0')]:
-        amps = _ev_list(ppar.get(amp_k, [0.0]))
-        r0s  = _ev_list(ppar.get(r0_k,  [0.0]))
-        for amp, r0 in zip(amps, r0s):
-            if amp > 0:
-                ax.axvline(r0 / AU, color='green', lw=0.8, ls='-.',
-                           label='vortex_r0')
-
     ax.set_xlabel('r (au)')
     ax.set_ylabel('dr/r (%)')
-    ax.set_title(f'r-grid  ({nr} cells)')
+    ax.set_title(f'r-grid  ({nr} cells, density-adaptive)')
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 
-    # --- panel 2: dtheta vs theta --------------------------------------------
     ax = axes[1]
-    th_c  = 0.5 * (yi[:-1] + yi[1:])
-    dth   = np.diff(yi)
+    th_c = 0.5 * (yi[:-1] + yi[1:])
+    dth  = np.diff(yi)
     ax.semilogy(np.degrees(th_c), np.degrees(dth), color='darkorange', linewidth=1.2)
-
-    # Shade disk region
-    H_outer = (_ev(ppar['hrdisk']) *
-               (_ev(ppar['rdisk']) / _ev(ppar['hrpivot']))**_ev(ppar['plh']) *
-               _ev(ppar['rdisk']))
-    sin_dt   = min(0.98, 3.0 * H_outer / _ev(ppar['rdisk']))
-    delta_th = np.degrees(np.arcsin(sin_dt))
-    ax.axvspan(90 - delta_th, 90 + delta_th, alpha=0.15, color='green',
-               label='disk ±3H')
     ax.axvline(90, color='gray', lw=0.8, ls='--', label='midplane')
-
-    ax.set_xlabel('θ (degrees)')
-    ax.set_ylabel('dθ (degrees)')
-    ax.set_title(f'θ-grid  ({nth} cells)')
+    hpr = _ev(ppar.get('hpr_prim_rout', 0.0))
+    if hpr > 0 and active.get('inner_rim'):
+        ax.axvline(90 - np.degrees(hpr), color='purple', lw=0.8, ls=':',
+                   label=f'shadow angle ({hpr:.3g} rad)')
+    ax.set_xlabel('theta (deg)')
+    ax.set_ylabel('dtheta (deg)')
+    ax.set_title(f'theta-grid  ({nth} cells, density-adaptive)')
     ax.legend(fontsize=7)
     ax.grid(True, alpha=0.3)
 
-    fig.suptitle('Smart Grid — cell spacing diagnostic', fontsize=11)
+    fig.suptitle('Smart Grid -- density-adaptive cell spacing', fontsize=11)
     fig.tight_layout()
-
     if outfile:
         fig.savefig(outfile, dpi=150, bbox_inches='tight')
         print(f'  Diagnostic plot saved to {outfile}')
@@ -697,7 +855,6 @@ def _make_diagnostic_plot(xbound, nx, ybound, ny, ppar, active, outfile=None):
 # ---------------------------------------------------------------------------
 
 def _load_config_as_dict(config_path):
-    """Import a pipeline config .py file and return its attributes as a dict."""
     spec   = importlib.util.spec_from_file_location('_grid_cfg', config_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -713,23 +870,24 @@ def _load_config_as_dict(config_path):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Smart adaptive grid builder for RADMC-3D disk simulations.')
+        description='Density-adaptive grid builder for RADMC-3D disk simulations.')
     parser.add_argument('--config', default=None,
-                        help='Path to a pipeline config .py file '
-                             '(default: Pipeline/config.py)')
+                        help='Path to a pipeline config .py file (default: Pipeline/config.py)')
     parser.add_argument('--dry-run', action='store_true',
-                        help='Show summary only — do not write amr_grid.inp')
+                        help='Show summary only -- do not write amr_grid.inp')
     parser.add_argument('--plot', action='store_true',
                         help='Save a diagnostic plot grid_builder_diag.png')
     parser.add_argument('--output', default='amr_grid.inp',
                         help='Output file name (default: amr_grid.inp)')
+    parser.add_argument('--threshold', type=float, default=0.1,
+                        help='Max |delta ln rho| per cell (default: 0.1 = 10%%). '
+                             'Smaller -> finer grid. Typical range: 0.03-0.3.')
     args = parser.parse_args()
 
-    # Locate config file
     if args.config:
         cfg_path = args.config
     else:
-        here = os.path.dirname(os.path.abspath(__file__))
+        here     = os.path.dirname(os.path.abspath(__file__))
         cfg_path = os.path.join(here, 'config.py')
 
     if not os.path.exists(cfg_path):
@@ -737,9 +895,8 @@ def main():
         sys.exit(1)
 
     print(f'Loading config: {cfg_path}')
-    ppar = _load_config_as_dict(cfg_path)
-
-    result = build_smart_grid(ppar, verbose=True)
+    ppar   = _load_config_as_dict(cfg_path)
+    result = build_smart_grid(ppar, threshold=args.threshold, verbose=True)
 
     if args.plot:
         _make_diagnostic_plot(

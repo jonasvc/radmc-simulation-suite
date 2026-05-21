@@ -27,9 +27,11 @@ IGNORE_RADMC_ERROR_LINES_IF_RETURN_OK = True
 
 
 def _as_count(value):
-    """Return the total cell count for a radmc3dPy grid count parameter."""
+    """Return the total cell count for a radmc3dPy grid count parameter.
+    nz=[0] is the axisymmetric sentinel (phi inactive) -- treat as 1 phi cell."""
     if isinstance(value, (list, tuple)):
-        return int(sum(value))
+        s = int(sum(value))
+        return 1 if s == 0 else s
     return int(value)
 
 

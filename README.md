@@ -1,6 +1,6 @@
 ﻿<div align="center">
 
-# RADMC ProtoDisk Suite `v0.1-alpha`
+# RADMC Simulation Suite `v0.1-alpha`
 
 **A config-driven RADMC-3D workflow for high-resolution protoplanetary-disk simulations.**
 
