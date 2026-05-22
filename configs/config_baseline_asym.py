@@ -22,7 +22,7 @@ dustkappas = [
 tstar          = 10000
 rstar          = '2.0*rs'
 mstar          = '2.5*ms'
-istar_sphere   = 1
+istar_sphere   = 0
 pc             = 144
 incl           = 45
 
@@ -60,19 +60,21 @@ zbound         = ["0.", "pi", "2*pi"]
 nz             = [300,300]
 
 ### Computational Parameters ###
-nphot          = '1e+9'
-nphot_scat     = '1e+9'
+nphot          = '1e+7'
+nphot_scat     = '1e+7'
 nphot_spec     = '1e+5'
-threads        = 30
-modified_random_walk = 1
-scattering_mode_max = 1
+threads        = 32
+modified_random_walk =0
+scattering_mode_max =1
 mc_scat_maxtauabs = 15
-
+mcscat_phi_coarsen = 1 
+mc_peeledoff       = 1
+mctherm_diagnostics = 1
 ### Image Parameters ###
 npix           = 2200
 wav            = 2.2
 phi            = 0
-sizeau         = 36
+sizeau         = 20
 nostar         = False
 arcsec         = False
 log            = True

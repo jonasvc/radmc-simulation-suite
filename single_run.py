@@ -661,6 +661,9 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
             f.write(f"mc_scat_maxtauabs = {params['mc_scat_maxtauabs']}\n")
             f.write(f"mcscat_phi_coarsen = {int(params.get('mcscat_phi_coarsen', 1))}\n")
             f.write(f"mc_peeledoff = {int(params.get('mc_peeledoff', 0))}\n")
+            f.write(f"mctherm_diagnostics = {int(params.get('mctherm_diagnostics', 0))}\n")
+            f.write(f"ifast = 1\n")
+            f.write(f"enthres = 0.01\n")
 
         validate_radmc_input_files(effective_params)
 
@@ -674,7 +677,7 @@ def run_single_simulation(params, run_dir, name, timestamp, make_images=False,
         tracker.start_phase("MC Thermal")
         phase_start = log_phase_start("MC Thermal")
         run_radmc_command(
-            f'{radmc3d_exe} mctherm setthreads {threads} sloppy',
+            f'{radmc3d_exe} mctherm setthreads {threads} sloppy mctherm_diagnostics 1',
             tracker, total_photons=params['nphot'], env=radmc_env)
         validate_mctherm_output()
         log_phase_end("MC Thermal", phase_start)

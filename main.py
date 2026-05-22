@@ -234,6 +234,31 @@ def run_single_mode(user_inputs, timestamp):
     )
     category = determine_category(params) if not iryss_meta else "iryss"
 
+    # Confirm nphot_scat raise here, before the countdown, so the user
+    # sees the reason and answers before the run starts.
+    if smart_grid_params is not None:
+        rec = smart_grid_params.get('nphot_scat_rec')
+        if rec is not None:
+            cfg_val = int(float(str(params.get('nphot_scat', 0))))
+            if cfg_val < rec:
+                print(
+                    f"\n  nphot_scat raised: {cfg_val:.2e} -> {rec:.2e}\n"
+                    f"  Reason: the smart grid has ~{rec // 10:,.0f} cells; "
+                    f"at least 10 photon hits per cell are needed to avoid\n"
+                    f"  spoke artifacts in the scattering source function "
+                    f"(each cell needs ~10 MC hits to reduce shot noise below ~30%).\n"
+                )
+                answer = input(f"  Accept nphot_scat = {rec:.2e}? [Y/n]: ").strip().lower()
+                if answer in ('n', 'no'):
+                    keep = input(f"  Enter value to use instead [default: {cfg_val:.2e}]: ").strip()
+                    try:
+                        params['nphot_scat'] = str(int(float(keep)))
+                    except ValueError:
+                        params['nphot_scat'] = str(cfg_val)
+                    print(f"  Using nphot_scat = {params['nphot_scat']}")
+                else:
+                    params['nphot_scat'] = str(int(rec))
+
     print_banner("single", name, category, timestamp)
     print_system_info()
     print_parameter_table(params, show_all=False)

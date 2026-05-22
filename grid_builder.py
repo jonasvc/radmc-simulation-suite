@@ -5,9 +5,6 @@ Evaluates the dust density model on a coarse probe grid, measures the actual
 |delta ln rho| gradient in r, theta, and phi, then marches to place cell
 interfaces so that every cell satisfies |delta ln rho| <= threshold.
 
-No analytical slope guessing or structure-specific heuristics.  If the density
-changes steeply somewhere, the grid resolves it; if it is flat, cells are coarse.
-
 Public API
 ----------
 build_smart_grid(ppar, threshold=0.1, verbose=True) -> dict
