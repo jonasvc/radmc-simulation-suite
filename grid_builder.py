@@ -35,6 +35,10 @@ RS  = 6.96e10
 _EVAL_NS = {'au': AU, 'AU': AU, 'pi': PI, 'PI': PI,
              'ms': MS, 'MS': MS, 'rs': RS, 'RS': RS, 'np': np}
 
+# Max |d ln rho / d ln r| allowed on cells adjacent to empty space, so the hard
+# sigma cutoffs at rin/rdisk (and drfact=0 gaps) get a few cells, not hundreds.
+_EDGE_GCAP = 20.0
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,13 +79,54 @@ def _nonzero(val):
         return bool(val)
 
 
-def _n_log(r_lo, r_hi, slope, threshold, n_min=5, n_max=500):
-    step = threshold / max(abs(slope), 0.05)
-    return max(n_min, min(n_max, int(np.ceil(np.log(r_hi / r_lo) / step))))
+def _refine_inner_wall(r_if, rin, ppar, rim_cells):
+    """
+    Force rim_cells across the first pressure scale height above rin.
+
+    The probe grid has at most 1-2 points spanning the density step at rin,
+    so the central-difference gradient there is badly underestimated and the
+    march produces cells that are too large.
+
+    This function computes the correct cell size analytically: the density
+    jumps from 0 to its disk value over a length scale of H_rin (the pressure
+    scale height at rin), so that is the scale the cells must resolve — exactly
+    what a correctly measured gradient would give. The numerical probe route
+    is skipped only because it is unreliable at this boundary, not because
+    the gradient physics is ignored.
+    """
+    if rim_cells <= 0:
+        return r_if
+
+    hrdisk  = float(_ev(ppar.get('hrdisk',  0.1)))
+    hrpivot = float(_ev(ppar.get('hrpivot', 100.0 * AU)))
+    plh     = float(_ev(ppar.get('plh',     0.0)))
+
+    H_rin   = hrdisk * (rin / hrpivot) ** plh * rin   # scale height at inner rim
+    r_wall  = rin + H_rin                              # outer edge of the forced zone
+
+    r_dense = np.geomspace(rin, r_wall, rim_cells + 1)
+
+    # Keep everything outside [rin, r_wall], replace interior with dense grid
+    r_keep  = r_if[(r_if <= rin) | (r_if >= r_wall)]
+    return np.unique(np.concatenate([r_keep, r_dense]))
 
 
-def _n_lin(lo, hi, step, n_min=3, n_max=300):
-    return max(n_min, min(n_max, int(np.ceil((hi - lo) / step))))
+def _guarantee_rim_cells(r_if, rin, hrdisk=0.1, prim_rout=1.0, n_min=10):
+    """Ensure at least n_min cells across the inner rim region regardless of threshold.
+
+    When a puffed inner rim is active, the structure extends to prim_rout*rin, so
+    the refinement zone covers [rin, prim_rout*rin].  Without a puffed rim, the
+    zone falls back to one pressure scale height [rin, rin*(1+2*hrdisk)].
+    """
+    if prim_rout > 1.0:
+        r_outer = rin * prim_rout
+    else:
+        r_outer = rin * (1.0 + 2.0 * hrdisk)
+    n_existing = int(np.sum((r_if > rin) & (r_if < r_outer)))
+    if n_existing >= n_min:
+        return r_if
+    new_pts = np.geomspace(rin, r_outer, n_min + 2)[1:-1]
+    return np.unique(np.concatenate([r_if, new_pts]))
 
 
 # ---------------------------------------------------------------------------
@@ -104,8 +149,10 @@ def _detect_active(ppar):
         'vortex_sig':     _nonzero(ppar.get('sig_vortex_amp', [0])),
         'inner_rim':      _ev(ppar.get('prim_rout', 0.0)) >= 1.0,
         'srim':           _ev(ppar.get('srim_rout', 0.0)) > 0.0,
-        'gaps':           any(abs(df) > 0 and abs(df) < 1.0
-                              for df in _ev_list(ppar.get('gap_drfact', [0.0]))),
+        'gaps':           any(df != 1.0 and go > gi for gi, go, df in
+                              zip(_ev_list(ppar.get('gap_rin',    [0.0])),
+                                  _ev_list(ppar.get('gap_rout',   [0.0])),
+                                  _ev_list(ppar.get('gap_drfact', [1.0])))),
         'warp':           bool(_ev(ppar.get('enable_warp', False))),
         'inner_edge':     bool(_ev(ppar.get('use_inner_edge_shadow', False))) and
                           bool(_ev(ppar.get('inner_edge_azimuthal', False))),
@@ -166,7 +213,11 @@ def _eval_hp(ppar, rcyl, phi, active):
             hpr0 = hrdisk * (p_rout * rin / hrpivot) ** plh
             if hpr0 > 1e-30:
                 dummy  = np.log10(max(hpr0 / hpr_prim, 1e-30)) / np.log10(max(p_rout, 1.001))
-                H_prim = hpr_prim * (rcyl / rin) ** dummy * rcyl
+                # Clamp the power base away from 0 (poles, rcyl->0) so a
+                # negative dummy cannot raise (rcyl/rin) to a huge value and
+                # overflow -- same safe_r guard used elsewhere in this module.
+                rcyl_safe = np.maximum(rcyl, rin * 1e-6)
+                H_prim = hpr_prim * (rcyl_safe / rin) ** dummy * rcyl
                 H      = np.maximum(H, H_prim)
 
     # Inner edge shadow: raised wall at edge_radius
@@ -316,13 +367,13 @@ def _eval_sigma(ppar, rcyl, phi, active):
             dphi = dphi / max(wphi, 1e-30)
             sig  = sig * (1.0 + DAMP * amp * np.exp(-0.5 * dr ** 2) * np.exp(-0.5 * dphi ** 2))
 
-    # Gap depletion
+    # Gap depletion / enhancement (model applies rho *= df for any df != 1)
     if active.get('gaps', False):
         grins  = _ev_list(ppar.get('gap_rin',    [0.0]))
         grouts = _ev_list(ppar.get('gap_rout',   [0.0]))
         gdfs   = _ev_list(ppar.get('gap_drfact', [1.0]))
         for g_in, g_out, df in zip(grins, grouts, gdfs):
-            if abs(df) > 0 and abs(df) < 1.0 and g_out > g_in:
+            if df != 1.0 and g_out > g_in:
                 sig = np.where((rcyl > g_in) & (rcyl < g_out), sig * df, sig)
 
     return sig
@@ -386,69 +437,140 @@ def _smooth(arr, n=7):
         return out
 
 
-def _march_log(x_probe, g, threshold, x_min, x_max, min_g=0.02):
+def _march_tv(x_probe, g, threshold, x_min, x_max, n_max=1500, label=None):
     """
-    Build log-spaced interfaces by marching from x_min to x_max.
-    At each position, step size dr/r = threshold / g(r).
+    Place log-spaced interfaces so each cell spans the same *total variation*
+    of ln(rho): the integral of g d(ln x) over a cell equals `threshold`.
+
+    A local-step march (x_next = x*(1 + threshold/g(x))) uses only the gradient
+    at the current point, so it steps right over a local density *maximum* (a
+    vortex or ring peak) where g -> 0 -- leaving one giant cell across the
+    feature.  Integrating the gradient instead accumulates both the up- and
+    down-slope variation, so a boundary is always placed across a peak.  Empty
+    space (g preset to 0 by the caller) contributes no variation and collapses
+    to a single coarse cell.
+
+    n_max is a safety backstop: if the segment needs more than n_max cells the
+    count is clipped (cells spread evenly in variation, not truncated) and a
+    one-line warning is printed so an under-resolved grid is never silent.
     """
-    interfaces = [float(x_min)]
-    x = float(x_min)
-    x_max = float(x_max)
-    while x < x_max * (1.0 - 1e-9):
-        gi     = max(float(np.interp(x, x_probe, g)), min_g)
-        x_next = x * (1.0 + threshold / gi)
-        if x_next >= x_max:
-            break
-        interfaces.append(x_next)
-        x = x_next
-    interfaces.append(x_max)
-    return np.array(interfaces)
+    lnx = np.log(x_probe)
+    # Cumulative variation:  cv(x) = integral_{x_probe[0]}^{x} g d(ln x)
+    cv  = np.concatenate([[0.0], np.cumsum(0.5 * (g[1:] + g[:-1]) * np.diff(lnx))])
+    lo, hi       = np.log(float(x_min)), np.log(float(x_max))
+    cv_lo, cv_hi = np.interp([lo, hi], lnx, cv)
+    total = cv_hi - cv_lo
+
+    n = int(np.ceil(total / threshold)) if total > 0 else 1
+    if n > n_max:
+        n = n_max
+        if label:
+            print(f"  WARNING: {label} hit {n_max}-cell cap -- feature "
+                  f"under-resolved; raise --threshold or n_max")
+    n = max(1, n)
+
+    # Interfaces at equal increments of cumulative variation, inverted back to x
+    targets = cv_lo + np.linspace(0.0, total, n + 1)
+    lnif    = np.interp(targets, cv, lnx)
+    lnif[0], lnif[-1] = lo, hi
+    return np.exp(lnif)
 
 
-def _march_lin(x_probe, g, threshold, x_min, x_max, min_g=None):
+def _march_lin(x_probe, g, threshold, x_min, x_max, min_g=None,
+               n_max=1000, label=None):
     """
     Build linearly-spaced interfaces by marching from x_min to x_max.
     At each position, step size dx = threshold / g(x).
+
+    min_g floors the gradient (caps the largest cell).  n_max is a safety
+    backstop that does NOT bind in normal use: a first pass marches with no
+    ceiling, and only if that would place more than n_max cells do we re-march
+    with a gradient ceiling g_max = threshold*n_max/span (spreading the budget
+    evenly rather than truncating into one giant cell) and warn.
     """
     if min_g is None:
         min_g = threshold / max(float(x_max) - float(x_min), 1e-30) * 3.0
-    interfaces = [float(x_min)]
-    x = float(x_min)
+    x_min = float(x_min)
     x_max = float(x_max)
-    while x < x_max * (1.0 - 1e-9):
-        gi     = max(float(np.interp(x, x_probe, g)), min_g)
-        x_next = x + threshold / gi
-        if x_next >= x_max:
-            break
-        interfaces.append(x_next)
-        x = x_next
-    interfaces.append(x_max)
-    return np.array(interfaces)
+    span  = x_max - x_min
+
+    def run(g_ceiling, stop_at_nmax):
+        interfaces = [x_min]
+        x = x_min
+        while x < x_max * (1.0 - 1e-9):
+            gi     = min(max(float(np.interp(x, x_probe, g)), min_g), g_ceiling)
+            x_next = x + threshold / gi
+            if x_next >= x_max:
+                break
+            interfaces.append(x_next)
+            x = x_next
+            if stop_at_nmax and len(interfaces) - 1 >= n_max:
+                return None
+        interfaces.append(x_max)
+        return np.array(interfaces)
+
+    out = run(np.inf, stop_at_nmax=True)
+    if out is not None:
+        return out
+    if label:
+        print(f"  WARNING: {label} hit {n_max}-cell cap -- feature "
+              f"under-resolved; raise --threshold or n_max")
+    g_max = threshold * n_max / span if span > 0 else np.inf
+    return run(g_max, stop_at_nmax=False)
 
 
 # ---------------------------------------------------------------------------
 # Interface builders from probe density
 # ---------------------------------------------------------------------------
 
-def _build_r_interfaces(r_c, th_c, rho, threshold):
+def _build_r_interfaces(r_c, th_c, rho, threshold, rin):
     """
     Build r interfaces from |d ln rho / d ln r| measured at the midplane.
     Using the midplane slice avoids picking up near-zero polar densities that
     would create false huge gradients at rin/rdisk where sigma transitions.
+
+    The march is split at rin so the cavity (empty, one coarse cell) and the
+    disk are handled separately.
+
+    Gradient floor handling: only genuinely-empty regions (cavity, vacuum gaps
+    with drfact=0, beyond rdisk) are excluded from refinement -- detected as
+    density below 1e-30 of the peak, NOT a fixed fraction of the global max.
+    An earlier 1e-4-of-peak floor flattened the entire faint outer disk (which
+    is far below 1e-4 of the bright inner rim), so outer-disk structure and the
+    radial power-law were never resolved.  Cells adjacent to empty space (the
+    hard sigma cutoffs at rin/rdisk) have their gradient capped so the
+    artificial cliff gets a few cells rather than hundreds.
     """
     i_mid = np.argmin(np.abs(th_c - PI / 2.0))
-    dn    = max(1, len(th_c) // 20)           # ~5% of probe cells around midplane
+    dn    = max(1, len(th_c) // 20)
     i_lo  = max(0, i_mid - dn)
     i_hi  = min(len(th_c), i_mid + dn + 1)
-    rho_mid   = rho[:, i_lo:i_hi, :].max(axis=(1, 2))   # (nr,)
-    rho_floor = max(float(rho_mid.max()) * 1e-4, 1e-100)
-    rho_mid   = np.maximum(rho_mid, rho_floor)
-    g_r = np.abs(np.gradient(np.log(rho_mid), np.log(r_c)))
-    g_r = np.maximum(_smooth(g_r, n=7), 0.02)
-    return _march_log(r_c, g_r, threshold, r_c[0], r_c[-1], min_g=0.02)
+    rho_mid = rho[:, i_lo:i_hi, :].max(axis=(1, 2))
+    peak    = float(rho_mid.max())
+    tiny    = peak * 1e-30 if peak > 0 else 1e-100
+    empty   = rho_mid <= tiny
+
+    g_r = np.abs(np.gradient(np.log(np.maximum(rho_mid, tiny)), np.log(r_c)))
+    # Cells touching empty space are the artificial rin/rdisk (and drfact=0)
+    # cliffs; cap their gradient so they don't consume the whole cell budget.
+    edge = np.zeros_like(empty)
+    edge[1:]  |= empty[:-1]
+    edge[:-1] |= empty[1:]
+    edge      &= ~empty
+    g_r = np.where(empty, 0.0, g_r)
+    g_r = np.where(edge,  np.minimum(g_r, _EDGE_GCAP), g_r)
+    g_r = _smooth(g_r, n=3)
+
+    # Cavity: empty -> collapses to one coarse cell.  Disk: resolves the real
+    # density variation (power-law, gaps, vortices) to `threshold` per cell.
+    r_if_cav  = _march_tv(r_c, g_r, threshold, r_c[0], rin,     n_max=1500,
+                          label='r-march (cavity)')
+    r_if_disk = _march_tv(r_c, g_r, threshold, rin,    r_c[-1], n_max=1500,
+                          label='r-march (disk)')
+    return np.concatenate([r_if_cav, r_if_disk[1:]])
 
 
-def _build_th_interfaces(r_c, th_c, rho, threshold):
+def _build_th_interfaces(r_c, th_c, rho, threshold, hrdisk=0.1):
     """
     Build theta interfaces from the maximum |d ln rho / d theta| over all (r, phi).
     The grid is symmetric around pi/2 (exact midplane boundary).
@@ -474,8 +596,15 @@ def _build_th_interfaces(r_c, th_c, rho, threshold):
 
     # Worst-case requirement over all r and phi
     g_th = g_th_3d.max(axis=(0, 2))
-    # Floor: at most 0.25 rad/cell (prevents single-cell steps wider than ~14 deg)
-    g_th = np.maximum(_smooth(g_th, n=7), threshold / 0.25)
+    # Physics-based floor: at least 4 cells per disk scale height near the midplane.
+    # hrdisk is H/r at the pivot radius, so arctan(hrdisk) ~ hrdisk is the
+    # scale height angle. This constraint is threshold-independent so the disk
+    # surface is always resolved regardless of the chosen gradient threshold.
+    dth_scale = float(hrdisk) / 4.0
+    # Also cap at 0.10 rad (~6 deg) as a hard geometric maximum.
+    dth_max   = min(dth_scale, 0.10)
+    min_g_th  = threshold / dth_max
+    g_th = np.maximum(_smooth(g_th, n=7), min_g_th)
 
     # Build upper hemisphere only (theta from th_c[0] toward pi/2)
     mask   = th_c <= PI / 2.0 + 1e-6
@@ -484,7 +613,7 @@ def _build_th_interfaces(r_c, th_c, rho, threshold):
 
     th_if_up = _march_lin(th_up, g_up, threshold,
                           x_min=th_c[0], x_max=PI / 2.0,
-                          min_g=threshold / 0.25)
+                          min_g=min_g_th, n_max=800, label='theta-march')
     th_if_up[-1] = PI / 2.0   # exact midplane -- required by radmc3dPy
 
     # Mirror for lower hemisphere (skip duplicate pi/2)
@@ -518,7 +647,8 @@ def _build_ph_interfaces(r_c, th_c, ph_c, rho, threshold, active):
 
     ph_if      = _march_lin(ph_c, g_ph, threshold,
                             x_min=0.0, x_max=2.0 * PI,
-                            min_g=threshold / (PI / 6.0))
+                            min_g=threshold / (PI / 6.0),
+                            n_max=1080, label='phi-march')
     ph_if[-1]  = 2.0 * PI
     return ph_if
 
@@ -537,6 +667,28 @@ def _to_segments(interfaces):
     """
     N      = len(interfaces)
     bounds = [float(v) for v in interfaces]
+    if N == 2:
+        return bounds, [1]
+    counts = [1] * (N - 2) + [2]
+    return bounds, counts
+
+
+def _to_segments_r(interfaces):
+    """Like _to_segments but expresses r-bounds as '<value>*au' strings.
+
+    This makes the returned xbound human-readable in the same format the user
+    writes manually in the params file.  _interfaces() evaluates these strings
+    via _ev(), so all downstream code is transparent to the change.
+    """
+    N      = len(interfaces)
+    bounds = [f'{float(v) / AU:.6g}*au' for v in interfaces]
+    # 6 sig figs is ample for any realistic grid, but guard against two
+    # adjacent interfaces ever rounding to the same string (which would make a
+    # zero-width cell): if the round-tripped values are not strictly
+    # increasing, fall back to full precision.
+    vals = [float(_ev(b)) for b in bounds]
+    if any(hi <= lo for lo, hi in zip(vals[:-1], vals[1:])):
+        bounds = [f'{float(v) / AU:.12g}*au' for v in interfaces]
     if N == 2:
         return bounds, [1]
     counts = [1] * (N - 2) + [2]
@@ -609,7 +761,7 @@ def _estimate_ram_gib(ncell, n_spec=1):
 # ---------------------------------------------------------------------------
 
 def _print_summary(xbound, nx, ybound, ny, zbound, nz,
-                   active, orig_ppar, threshold,
+                   active, orig_ppar, threshold, rim_cells=0,
                    nphot_scat_rec=None, nphot_scat_cfg=None):
     nr,  xi = _nr_from_grid(xbound, nx)
     nth, yi = _nth_from_grid(ybound, ny)
@@ -630,6 +782,15 @@ def _print_summary(xbound, nx, ybound, ny, zbound, nz,
     print('-' * W)
     print(f'  Threshold          : {threshold:.3g}  '
           f'(max |delta ln rho| per cell = {threshold*100:.1f}%)')
+    if rim_cells > 0:
+        hrdisk  = float(_ev(orig_ppar.get('hrdisk',  0.1)))
+        hrpivot = float(_ev(orig_ppar.get('hrpivot', 100.0 * AU)))
+        plh     = float(_ev(orig_ppar.get('plh',     0.0)))
+        rin_v   = _ev(orig_ppar['rin'])
+        H_rin   = hrdisk * (rin_v / hrpivot) ** plh * rin_v
+        print(f'  Rim refinement     : {rim_cells} cells in '
+              f'[rin, rin + H_rin]  (H_rin = {H_rin/AU:.4f} au, '
+              f'analytical gradient resolution)')
 
     on  = [k for k, v in active.items() if v]
     off = [k for k, v in active.items() if not v]
@@ -690,7 +851,7 @@ def _print_summary(xbound, nx, ybound, ny, zbound, nz,
 # Main public function
 # ---------------------------------------------------------------------------
 
-def build_smart_grid(ppar, threshold=0.1, verbose=True):
+def build_smart_grid(ppar, threshold=0.1, rim_cells=30, verbose=True):
     """
     Compute an optimal RADMC-3D spherical grid from a pipeline params dict.
 
@@ -702,6 +863,10 @@ def build_smart_grid(ppar, threshold=0.1, verbose=True):
     ----------
     ppar      : dict   -- pipeline config params (string values like '0.5*au' are ok).
     threshold : float  -- max |delta ln rho| per cell (default 0.1 = 10%).
+    rim_cells : int    -- cells across the first scale height above rin,
+                          computed analytically from H_rin because the probe
+                          gradient is unreliable at the density step there
+                          (default 30). Set to 0 to disable.
     verbose   : bool   -- print the summary table.
 
     Returns
@@ -714,12 +879,17 @@ def build_smart_grid(ppar, threshold=0.1, verbose=True):
     r_c, th_c, ph_c, rho = _eval_probe_density(ppar, active)
 
     # Build interface arrays from measured density gradients
-    r_if  = _build_r_interfaces(r_c, th_c, rho, threshold)
-    th_if = _build_th_interfaces(r_c, th_c, rho, threshold)
+    rin    = _ev(ppar['rin'])
+    hrdisk = float(_ev(ppar.get('hrdisk', 0.1)))
+    r_if  = _build_r_interfaces(r_c, th_c, rho, threshold, rin)
+    prim_rout = float(_ev(ppar.get('prim_rout', 1.0)))
+    r_if  = _guarantee_rim_cells(r_if, rin, hrdisk=hrdisk, prim_rout=prim_rout, n_min=10)
+    r_if  = _refine_inner_wall(r_if, rin, ppar, rim_cells)
+    th_if = _build_th_interfaces(r_c, th_c, rho, threshold, hrdisk)
     ph_if = _build_ph_interfaces(r_c, th_c, ph_c, rho, threshold, active)
 
     # Convert to (bounds, counts) format for radmc3dPy / problemSetupDust
-    xbound, nx = _to_segments(r_if)
+    xbound, nx = _to_segments_r(r_if)
     ybound, ny = _to_segments_th(th_if)
 
     if len(ph_if) == 2:                    # axisymmetric: radmc3dPy needs nz=[0] to
@@ -737,7 +907,7 @@ def build_smart_grid(ppar, threshold=0.1, verbose=True):
 
     if verbose:
         _print_summary(xbound, nx, ybound, ny, zbound, nz,
-                       active, ppar, threshold,
+                       active, ppar, threshold, rim_cells=rim_cells,
                        nphot_scat_rec=nphot_scat_rec,
                        nphot_scat_cfg=_ev(ppar.get('nphot_scat', 0)))
 
@@ -848,6 +1018,293 @@ def _make_diagnostic_plot(xbound, nx, ybound, ny, ppar, active, outfile=None):
 
 
 # ---------------------------------------------------------------------------
+# Spatial grid visualization
+# ---------------------------------------------------------------------------
+
+def _make_spatial_plot(xbound, nx, ybound, ny, ppar, active, outfile=None):
+    """
+    2D spatial grid visualization in (R, z) coordinates.
+    Left panel : full disk — density colormap + cell boundaries.
+    Right panel : inner rim zoom — shows the analytical rim refinement.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LogNorm
+    except ImportError:
+        print('matplotlib not available -- skipping spatial plot')
+        return
+
+    nr, xi = _nr_from_grid(xbound, nx)
+    nth, yi = _nth_from_grid(ybound, ny)
+
+    rin       = _ev(ppar['rin'])
+    rdisk     = _ev(ppar['rdisk'])
+    hrdisk    = float(_ev(ppar.get('hrdisk',    0.1)))
+    hrpivot   = float(_ev(ppar.get('hrpivot',   100.0 * AU)))
+    plh       = float(_ev(ppar.get('plh',       0.0)))
+    prim_rout = float(_ev(ppar.get('prim_rout', 1.0)))
+    H_rin     = hrdisk * (rin / hrpivot) ** plh * rin
+
+    # Interface corner coordinates (nr+1, nth+1) in au
+    R_if = xi[:, None] * np.sin(yi[None, :]) / AU
+    Z_if = xi[:, None] * np.cos(yi[None, :]) / AU
+
+    # Cell-centre density (nr, nth) — phi=0, valid for axisymmetric models
+    r_c  = 0.5 * (xi[:-1] + xi[1:])
+    th_c = 0.5 * (yi[:-1] + yi[1:])
+    R_c  = r_c[:, None] * np.sin(th_c[None, :])
+    Z_c  = r_c[:, None] * np.cos(th_c[None, :])
+    PH_c = np.zeros_like(R_c)
+
+    H_c   = _eval_hp(ppar, R_c, PH_c, active)
+    SIG_c = _eval_sigma(ppar, R_c, PH_c, active)
+    H_c   = np.maximum(H_c, 1e-30 * rin)
+    rho_c = np.maximum(SIG_c, 0.0) / H_c * np.exp(-0.5 * (Z_c / H_c) ** 2)
+
+    rho_max = float(rho_c.max()) if rho_c.max() > 0 else 1.0
+    rho_c   = np.maximum(rho_c, rho_max * 1e-8)
+    norm    = LogNorm(vmin=rho_max * 1e-8, vmax=rho_max)
+
+    rin_au   = rin  / AU
+    rdisk_au = rdisk / AU
+    H_rin_au = H_rin / AU
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7), facecolor='#0a0a0a')
+
+    panels = [
+        dict(r_hi   = rdisk_au * 1.05,
+             z_hi   = rdisk_au * 0.35,
+             step_r = max(1, nr // 60),
+             step_th= max(1, nth // 40),
+             title  = f'Full disk  ({nr} r × {nth} θ = {nr*nth:,} cells)',
+             zoom   = False),
+        dict(r_hi   = max(prim_rout, 2.5) * rin_au * 1.4,
+             z_hi   = max(prim_rout, 2.5) * rin_au * 0.55,
+             step_r = 1,                       # draw every r-interface in zoom
+             step_th= max(1, nth // 60),
+             title  = (f'Inner rim  (rin = {rin_au:.2f} au,  '
+                       f'H_rin = {H_rin_au:.4f} au)'),
+             zoom   = True),
+    ]
+
+    for ax, p in zip(axes, panels):
+        ax.set_facecolor('black')
+
+        # Density as pcolormesh on the actual curvilinear (r, theta) → (R, z) grid
+        ax.pcolormesh(R_if, Z_if, rho_c,
+                      norm=norm, cmap='inferno',
+                      shading='flat', rasterized=True)
+
+        # r-interface arcs — one polyline per radial shell
+        for i in range(0, nr + 1, p['step_r']):
+            if xi[i] / AU > p['r_hi'] * 1.02:
+                continue
+            ax.plot(R_if[i, :], Z_if[i, :], '-',
+                    color='white', lw=0.15, alpha=0.4)
+
+        # theta-interface rays — one polyline per meridional boundary
+        r_mask = xi / AU <= p['r_hi'] * 1.02
+        for j in range(0, nth + 1, p['step_th']):
+            ax.plot(R_if[r_mask, j], Z_if[r_mask, j], '-',
+                    color='white', lw=0.15, alpha=0.4)
+
+        # Reference lines
+        ax.axhline(0, color='#777', lw=0.5, ls='--', alpha=0.5)
+        ax.axvline(rin_au, color='cyan', lw=0.9, ls='--', alpha=0.85,
+                   label=f'rin = {rin_au:.2f} au')
+        if p['zoom']:
+            ax.axvline(prim_rout * rin_au, color='orange', lw=0.9, ls=':',
+                       alpha=0.85,
+                       label=f'prim_rout×rin = {prim_rout * rin_au:.2f} au')
+            ax.axvline(rin_au + H_rin_au, color='lime', lw=0.9, ls=':',
+                       alpha=0.85,
+                       label=f'rin + H_rin = {rin_au + H_rin_au:.3f} au')
+
+        ax.set_xlim(0, p['r_hi'])
+        ax.set_ylim(-p['z_hi'], p['z_hi'])
+        ax.set_xlabel('R  (au)', color='white', fontsize=11)
+        ax.set_ylabel('z  (au)', color='white', fontsize=11)
+        ax.set_title(p['title'], color='white', fontsize=10, pad=8)
+        ax.tick_params(colors='white', which='both')
+        for spine in ax.spines.values():
+            spine.set_edgecolor('#444')
+        ax.legend(fontsize=8, loc='upper right',
+                  facecolor='#1a1a1a', labelcolor='white', edgecolor='#555')
+
+    fig.suptitle('RADMC-3D Grid — density-adaptive cell spacing',
+                 color='white', fontsize=13)
+    fig.tight_layout(rect=[0, 0, 0.93, 1])
+
+    cbar_ax = fig.add_axes([0.95, 0.12, 0.015, 0.75])
+    sm = plt.cm.ScalarMappable(cmap='inferno', norm=norm)
+    cbar = fig.colorbar(sm, cax=cbar_ax)
+    cbar.set_label('log₁₀ ρ  (rel.)', color='white', fontsize=10)
+    cbar.ax.yaxis.set_tick_params(color='white')
+    plt.setp(cbar.ax.yaxis.get_ticklabels(), color='white')
+    cbar.outline.set_edgecolor('#444')
+
+    if outfile:
+        fig.savefig(outfile, dpi=150, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        print(f'  Spatial plot saved to {outfile}')
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Grid analysis plot
+# ---------------------------------------------------------------------------
+
+def _make_analysis_plot(xbound, nx, ybound, ny, ppar, active,
+                        threshold=0.1, outfile=None):
+    """
+    Third diagnostic figure — two panels in (R, z):
+      Left  : max |Δ ln ρ| per cell  — shows where the threshold is met/exceeded.
+      Right : cell aspect ratio log₁₀(r·dθ / dr) — shows elongated cells that
+              can cause ray-tracing artefacts even when the gradient is fine.
+    """
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import Normalize, TwoSlopeNorm
+    except ImportError:
+        print('matplotlib not available -- skipping analysis plot')
+        return
+
+    nr, xi = _nr_from_grid(xbound, nx)
+    nth, yi = _nth_from_grid(ybound, ny)
+
+    rin   = _ev(ppar['rin'])
+    rdisk = _ev(ppar['rdisk'])
+
+    # Corner coordinates  (nr+1, nth+1) in au
+    R_if = xi[:, None] * np.sin(yi[None, :]) / AU
+    Z_if = xi[:, None] * np.cos(yi[None, :]) / AU
+
+    # Cell-centre density  (nr, nth)
+    r_c  = 0.5 * (xi[:-1] + xi[1:])
+    th_c = 0.5 * (yi[:-1] + yi[1:])
+    R_c  = r_c[:, None] * np.sin(th_c[None, :])
+    Z_c  = r_c[:, None] * np.cos(th_c[None, :])
+    PH_c = np.zeros_like(R_c)
+
+    H_c   = _eval_hp(ppar, R_c, PH_c, active)
+    SIG_c = _eval_sigma(ppar, R_c, PH_c, active)
+    H_c   = np.maximum(H_c, 1e-30 * rin)
+    rho_c = np.maximum(SIG_c, 0.0) / H_c * np.exp(-0.5 * (Z_c / H_c) ** 2)
+    rho_max = float(rho_c.max()) if rho_c.max() > 0 else 1.0
+    rho_c   = np.maximum(rho_c, rho_max * 1e-8)
+    log_rho = np.log(rho_c)
+
+    # ── |Δ ln ρ| per cell (forward difference in each direction) ─────────────
+    grad_r  = np.zeros((nr, nth))
+    grad_th = np.zeros((nr, nth))
+    grad_r[:-1, :]  = np.abs(np.diff(log_rho, axis=0))
+    grad_r[-1,  :]  = grad_r[-2, :]
+    grad_th[:, :-1] = np.abs(np.diff(log_rho, axis=1))
+    grad_th[:, -1]  = grad_th[:, -2]
+    delta_max = np.maximum(grad_r, grad_th)
+
+    # ── Cell aspect ratio  log₁₀(r·dθ / dr) ─────────────────────────────────
+    dr_cell  = np.diff(xi)    # (nr,)
+    dth_cell = np.diff(yi)    # (nth,)
+    ds_th    = r_c[:, None] * dth_cell[None, :]   # (nr, nth) arc length in θ
+    ds_r     = dr_cell[:, None] * np.ones((1, nth))
+    log_asp  = np.log10(np.maximum(ds_th / ds_r, 1e-9))
+
+    rin_au   = rin  / AU
+    rdisk_au = rdisk / AU
+    r_hi     = rdisk_au * 1.05
+    z_hi     = rdisk_au * 0.35
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7), facecolor='#0a0a0a')
+
+    # ── Panel 1: gradient satisfaction ───────────────────────────────────────
+    ax = axes[0]
+    ax.set_facecolor('black')
+
+    norm_g = TwoSlopeNorm(vmin=0, vcenter=threshold, vmax=threshold * 8)
+    im1    = ax.pcolormesh(R_if, Z_if, delta_max,
+                           norm=norm_g, cmap='RdYlGn_r',
+                           shading='flat', rasterized=True)
+    # White contour exactly at the threshold
+    ax.contour(R_c / AU, Z_c / AU, delta_max,
+               levels=[threshold], colors='white',
+               linewidths=1.0, linestyles='--', alpha=0.9)
+
+    ax.axhline(0, color='#777', lw=0.5, ls='--', alpha=0.5)
+    ax.axvline(rin_au, color='cyan', lw=0.9, ls='--', alpha=0.75,
+               label=f'rin = {rin_au:.2f} au')
+    ax.set_xlim(0, r_hi)
+    ax.set_ylim(-z_hi, z_hi)
+    ax.set_xlabel('R  (au)', color='white', fontsize=11)
+    ax.set_ylabel('z  (au)', color='white', fontsize=11)
+    ax.set_title(f'Max |Δ ln ρ| per cell  —  white dashed = threshold ({threshold})',
+                 color='white', fontsize=10, pad=8)
+    ax.tick_params(colors='white')
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#444')
+    ax.legend(fontsize=8, facecolor='#1a1a1a', labelcolor='white', edgecolor='#555')
+
+    cb1 = fig.colorbar(im1, ax=ax, fraction=0.046, pad=0.04)
+    cb1.set_label('|Δ ln ρ|', color='white', fontsize=10)
+    cb1.ax.yaxis.set_tick_params(color='white')
+    plt.setp(cb1.ax.yaxis.get_ticklabels(), color='white')
+    cb1.outline.set_edgecolor('#444')
+    cb1.ax.axhline(y=threshold, color='white', lw=1.2, ls='--')
+
+    # ── Panel 2: cell aspect ratio ────────────────────────────────────────────
+    ax = axes[1]
+    ax.set_facecolor('black')
+
+    asp_lim = min(max(abs(float(log_asp.max())), abs(float(log_asp.min()))), 3.0)
+    im2 = ax.pcolormesh(R_if, Z_if, log_asp,
+                        vmin=-asp_lim, vmax=asp_lim, cmap='RdBu',
+                        shading='flat', rasterized=True)
+    # White contour at aspect ratio = 1 (isotropic)
+    ax.contour(R_c / AU, Z_c / AU, log_asp,
+               levels=[0.0], colors='white',
+               linewidths=1.0, linestyles='-', alpha=0.9)
+
+    ax.axhline(0, color='#777', lw=0.5, ls='--', alpha=0.5)
+    ax.axvline(rin_au, color='cyan', lw=0.9, ls='--', alpha=0.75,
+               label=f'rin = {rin_au:.2f} au')
+    ax.set_xlim(0, r_hi)
+    ax.set_ylim(-z_hi, z_hi)
+    ax.set_xlabel('R  (au)', color='white', fontsize=11)
+    ax.set_ylabel('z  (au)', color='white', fontsize=11)
+    ax.set_title('Cell aspect ratio  log₁₀(r·dθ / dr)  —  white = isotropic',
+                 color='white', fontsize=10, pad=8)
+    ax.tick_params(colors='white')
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#444')
+    ax.legend(fontsize=8, facecolor='#1a1a1a', labelcolor='white', edgecolor='#555')
+
+    cb2 = fig.colorbar(im2, ax=ax, fraction=0.046, pad=0.04)
+    cb2.set_label('log₁₀(r·dθ / dr)', color='white', fontsize=10)
+    cb2.ax.yaxis.set_tick_params(color='white')
+    plt.setp(cb2.ax.yaxis.get_ticklabels(), color='white')
+    cb2.outline.set_edgecolor('#444')
+    cb2.ax.axhline(y=0.0, color='white', lw=1.2, ls='-')
+
+    fig.suptitle(f'RADMC-3D Grid Analysis  (threshold = {threshold})',
+                 color='white', fontsize=13)
+    fig.tight_layout()
+
+    if outfile:
+        fig.savefig(outfile, dpi=150, bbox_inches='tight',
+                    facecolor=fig.get_facecolor())
+        print(f'  Analysis plot saved to {outfile}')
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
@@ -879,6 +1336,9 @@ def main():
     parser.add_argument('--threshold', type=float, default=0.1,
                         help='Max |delta ln rho| per cell (default: 0.1 = 10%%). '
                              'Smaller -> finer grid. Typical range: 0.03-0.3.')
+    parser.add_argument('--rim-cells', type=int, default=30,
+                        help='Cells forced across the first scale height above rin, '
+                             'bypassing the probe gradient (default: 30). Set 0 to disable.')
     args = parser.parse_args()
 
     if args.config:
@@ -893,7 +1353,8 @@ def main():
 
     print(f'Loading config: {cfg_path}')
     ppar   = _load_config_as_dict(cfg_path)
-    result = build_smart_grid(ppar, threshold=args.threshold, verbose=True)
+    result = build_smart_grid(ppar, threshold=args.threshold,
+                              rim_cells=args.rim_cells, verbose=True)
 
     if args.plot:
         _make_diagnostic_plot(
@@ -901,6 +1362,19 @@ def main():
             result['ybound'], result['ny'],
             ppar, _detect_active(ppar),
             outfile='grid_builder_diag.png',
+        )
+        _make_spatial_plot(
+            result['xbound'], result['nx'],
+            result['ybound'], result['ny'],
+            ppar, _detect_active(ppar),
+            outfile='grid_builder_spatial.png',
+        )
+        _make_analysis_plot(
+            result['xbound'], result['nx'],
+            result['ybound'], result['ny'],
+            ppar, _detect_active(ppar),
+            threshold=args.threshold,
+            outfile='grid_builder_analysis.png',
         )
 
     if args.dry_run:
